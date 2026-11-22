@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,15 +16,18 @@ ROOT = Path(__file__).resolve().parents[1]
 @unittest.skipUnless(os.getenv('AGENT_MANAGER_LIVE') == '1','requires real local Herdr and authenticated Codex')
 class Live(unittest.TestCase):
     def test_native_agent_lifecycle(self):
-        parent = Path(os.environ.get('HERMES_HOME') or Path.home()/'.hermes')
+        default_home = (Path(os.environ['LOCALAPPDATA'])/'hermes' if os.name == 'nt'
+                        else Path.home()/'.hermes')
+        parent = Path(os.environ.get('HERMES_HOME') or default_home)
         skill = parent/'skills/hermes-herdr-pane-manager'
         self.assertTrue((skill/'scripts/pane_manager.py').is_file())
-        runtime = tempfile.TemporaryDirectory(prefix='am-')
+        runtime = tempfile.TemporaryDirectory(prefix='am-', dir=os.environ.get('TMPDIR'))
         self.addCleanup(runtime.cleanup)
         base = Path(runtime.name)
         temporary_home = base/'profile'
         (temporary_home/'skills').mkdir(parents=True)
-        (temporary_home/'skills'/skill.name).symlink_to(skill.resolve(), target_is_directory=True)
+        shutil.copytree(skill, temporary_home/'skills'/skill.name,
+                        ignore=shutil.ignore_patterns('.git', '__pycache__', '*.pyc'))
         # The operator supplies a disposable server; this suite never launches Herdr directly.
         env = dict(os.environ)
         env['HERMES_HOME'] = str(temporary_home)
@@ -34,7 +38,7 @@ class Live(unittest.TestCase):
         subprocess.run(['git','init','-q',str(workspace)],check=True,env=env)
 
         def call(script, args, timeout=35):
-            r = subprocess.run([sys.executable,'-I',str(script),*args],env=env,capture_output=True,text=True,timeout=timeout)
+            r = subprocess.run([sys.executable,'-I','-B',str(script),*args],env=env,capture_output=True,encoding='utf-8',timeout=timeout)
             try:
                 return json.loads(r.stdout)
             except ValueError:
@@ -52,6 +56,7 @@ class Live(unittest.TestCase):
         created = call(pane_script,['workspace-create','--instance',instance,'--label','agent-manager-smoke','--cwd',str(workspace)])
         self.assertTrue(created.get('ok'),created)
         where = ['--instance',instance,'--workspace',created['result']['workspace_id']]
+        self.addCleanup(call, pane_script, ['close',*where,'--pane',created['result']['root_pane_id']])
         provisioned = call(manager,['provision',*where,'--cwd',str(workspace)])
         self.assertTrue(provisioned.get('ok'),provisioned)
         where += ['--pane',provisioned['result']['pane_id']]
@@ -70,6 +75,11 @@ class Live(unittest.TestCase):
         rates = call(manager,['get-remaining-tokens',*where,'--agent','codex'])
         self.assertTrue(rates.get('ok'),rates)
         self.assertIn('remaining_percent',rates['result']['primary'])
+        if os.name == 'nt':
+            # Don't discover or fault-inject into arbitrary Windows processes.
+            recovered = call(manager,['recover',*where],65)
+            self.assertEqual(recovered.get('error', {}).get('code'), 'codex_still_running', recovered)
+            return
         receipt, = (temporary_home/'agent-manager').glob('*.json')
         key = json.loads(receipt.read_text())['token'].encode()
         matches = []
@@ -78,7 +88,7 @@ class Live(unittest.TestCase):
                 command = candidate.read_bytes().split(b'\x00')
             except OSError:
                 continue
-            if command[1:5] == [b'-I', os.fsencode(manager), b'_serve', key]:
+            if command[1:6] == [b'-I', b'-B', os.fsencode(manager), b'_serve', key]:
                 matches.append(candidate.parent)
         receiver, = matches
         self.assertEqual(receiver.stat().st_uid, os.getuid())
