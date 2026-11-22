@@ -716,6 +716,17 @@ class Receiver:
         if not self.mutation.acquire(blocking=False):
             raise Error('receiver_busy', 'Another operation is in progress; inspect before retrying')
         try:
+            if op == 'steer-bound':
+                expected, previous = packet.get('expected_thread'), packet.get('after_turn')
+                if (not isinstance(expected,str) or not expected.strip() or len(expected)>256 or
+                        (previous is not None and (not isinstance(previous,str) or not previous.strip() or len(previous)>256)) or
+                        packet.get('expected_turn') is not None):
+                    raise Error('invalid_binding','Bound steer requires a saved thread and is only for idle follow-up')
+                if self.thread != expected:
+                    raise Error('thread_changed','Expected thread does not match; no prompt was sent')
+                if previous is not None and self.turn != previous:
+                    raise Error('turn_changed','Previous turn does not match; no prompt was sent')
+                op = 'steer'
             reply = self.apply(op, packet, check)
             backend = self.active_backend()
         except Error as exc:
@@ -901,7 +912,7 @@ def serve(token, cwd, scope, agent='codex'):
                     return until
                 if packet.get('op') != 'hello':
                     check()
-                if packet.get('op') in ('wait','steer') and (type(packet.get('seconds')) is not int or not 1 <= packet['seconds'] <= 600):
+                if packet.get('op') in ('wait','steer','steer-bound') and (type(packet.get('seconds')) is not int or not 1 <= packet['seconds'] <= 600):
                     raise Error('invalid_wait', 'Wait must be 1 through 600 seconds')
                 result = {'ok':True,'result':receiver.dispatch(packet,check)}
             except Error as e:
@@ -1050,6 +1061,9 @@ def main():
             p.add_argument('--seconds',type=int,choices=range(1,601),metavar='1-600',default=120)
         if op in ('steer','wait'):
             p.add_argument('--turn-id',required=(op=='wait'))
+        if op=='steer':
+            p.add_argument('--thread-id',help='Require this native thread for an idle follow-up')
+            p.add_argument('--after-turn-id',help='Also require this last turn; use with --thread-id')
     internal=commands.add_parser('_serve',allow_abbrev=False)
     internal.add_argument('token')
     internal.add_argument('cwd')
@@ -1060,6 +1074,9 @@ def main():
     a=parser.parse_args()
     if a.op == 'run' and a.agent == 'codex' and a.model is None:
         parser.error('run --agent codex requires --model')
+    if a.op == 'steer' and ((a.after_turn_id is not None and a.thread_id is None) or
+                            (a.thread_id is not None and a.turn_id is not None)):
+        parser.error('--after-turn-id requires --thread-id; --turn-id cannot be used with --thread-id')
     try:
         if os.name != 'nt' and not sys.platform.startswith('linux'):
             raise Error('unsupported_platform','The agent-manager receiver requires Windows or Linux')
@@ -1093,7 +1110,11 @@ def main():
                 fields['turn_id']=a.turn_id
             if a.op == 'steer':
                 fields['expected_turn']=a.turn_id
-            result=request(token,'quota' if a.op=='get-remaining-tokens' else a.op,**fields)
+            op='quota' if a.op=='get-remaining-tokens' else a.op
+            if a.op=='steer' and a.thread_id is not None:
+                fields.update(expected_thread=a.thread_id,after_turn=a.after_turn_id)
+                op='steer-bound'  # An older receiver must reject it, not ignore a new field.
+            result=request(token,op,**fields)
         print(json.dumps(dict(ok=True,result=result)))
         return 0
     except (Error, OSError, ValueError) as e:

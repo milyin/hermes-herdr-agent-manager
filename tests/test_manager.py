@@ -110,6 +110,37 @@ class Contract(unittest.TestCase):
         self.assertIn('modelNotFound',str(caught.exception))
         self.assertNotIn('private diagnostic payload',str(caught.exception))
 
+    def test_bound_steer_checks_saved_thread_and_idle_turn_before_submission(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        receiver.thread, receiver.turn = 'owned-thread', 'finished-turn'
+        with patch.object(receiver, 'apply') as apply, patch.object(receiver, 'active_backend') as backend:
+            backend.return_value.wait.return_value = {'turn_id':'new-turn'}
+            packet = dict(op='steer-bound', prompt='test', seconds=1, expected_thread='owned-thread', after_turn='finished-turn')
+            for changes, code in (({'expected_thread':'wrong'},'thread_changed'), ({'after_turn':'wrong'},'turn_changed'),
+                                  ({'expected_thread':None},'invalid_binding')):
+                with self.assertRaises(mod.Error) as caught:
+                    receiver.dispatch(dict(packet, **changes))
+                self.assertEqual(caught.exception.code, code)
+                apply.assert_not_called()
+            apply.return_value = {'thread_id':'owned-thread','turn_id':'new-turn'}
+            self.assertEqual(receiver.dispatch(packet)['turn_id'],'new-turn')
+            self.assertEqual(apply.call_args.args[0],'steer')
+            backend.return_value.wait.assert_called_once_with('owned-thread','new-turn',1)
+
+    def test_bound_steer_cannot_turn_into_active_steering(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        receiver.thread, receiver.turn = 'owned-thread', 'active-turn'
+        with patch.object(receiver, 'codex') as backend:
+            backend.dead = False
+            backend.state.return_value = {}
+            with self.assertRaises(mod.Error) as caught:
+                receiver.dispatch(dict(op='steer-bound', prompt='do not send', seconds=1,
+                                       expected_thread='owned-thread', after_turn='active-turn'))
+            self.assertEqual(caught.exception.code, 'turn_active')
+            backend.rpc.assert_not_called()
+
     def test_recover_resumes_exact_thread_without_replaying_prompt(self):
         mod = api()
         receiver = mod.Receiver('/workspace')
