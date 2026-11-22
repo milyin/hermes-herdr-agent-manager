@@ -13,9 +13,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-@unittest.skipUnless(os.getenv('AGENT_MANAGER_LIVE') == '1','requires real local Herdr and authenticated Codex')
 class Live(unittest.TestCase):
-    def test_native_agent_lifecycle(self):
+    def fixture(self, *, agent):
         default_home = (Path(os.environ['LOCALAPPDATA'])/'hermes' if os.name == 'nt'
                         else Path.home()/'.hermes')
         parent = Path(os.environ.get('HERMES_HOME') or default_home)
@@ -30,7 +29,8 @@ class Live(unittest.TestCase):
                         ignore=shutil.ignore_patterns('.git', '__pycache__', '*.pyc'))
         # The operator supplies a disposable server; this suite never launches Herdr directly.
         env = dict(os.environ)
-        env['HERMES_HOME'] = str(temporary_home)
+        # Hermes ACP uses a configured profile for the live test; an empty home cannot answer.
+        env['HERMES_HOME'] = str(parent if agent == 'hermes' else temporary_home)
         instance = env['AGENT_MANAGER_TEST_INSTANCE']
         self.assertTrue(instance.startswith('agent-manager-smoke-'))
         workspace = base/'empty'
@@ -53,14 +53,42 @@ class Live(unittest.TestCase):
             time.sleep(.1)
         else:
             self.fail(f'Isolated Herdr unavailable: {ready}')
-        created = call(pane_script,['workspace-create','--instance',instance,'--label','agent-manager-smoke','--cwd',str(workspace)])
+        created = call(pane_script,['workspace-create','--instance',instance,'--label',f'agent-manager-smoke-{agent}','--cwd',str(workspace)])
         self.assertTrue(created.get('ok'),created)
         where = ['--instance',instance,'--workspace',created['result']['workspace_id']]
         self.addCleanup(call, pane_script, ['close',*where,'--pane',created['result']['root_pane_id']])
-        provisioned = call(manager,['provision',*where,'--cwd',str(workspace)])
+        provisioned = call(manager,['provision',*where,'--cwd',str(workspace),'--agent',agent])
         self.assertTrue(provisioned.get('ok'),provisioned)
         where += ['--pane',provisioned['result']['pane_id']]
         self.addCleanup(call, pane_script, ['close',*where])
+        self.assertEqual(provisioned['result']['agent'],agent)
+        return call, manager, where, workspace, temporary_home
+
+    @unittest.skipUnless(os.getenv('AGENT_MANAGER_HERMES_LIVE') == '1','requires real local Herdr and configured Hermes ACP')
+    def test_native_hermes_lifecycle(self):
+        call, manager, where, workspace, _ = self.fixture(agent='hermes')
+        run = call(manager,['run',*where,'--cwd',str(workspace),'--agent','hermes',
+                            '--prompt','Remember the word JUNIPER. Reply with exactly AM_HERMES. Do not use tools.'],80)
+        self.assertTrue(run.get('ok'),run)
+        self.assertEqual(run['result']['status'],'submitted')
+        wait = call(manager,['wait',*where,'--turn-id',run['result']['turn_id'],'--seconds','40'],85)
+        self.assertTrue(wait.get('ok'),wait)
+        self.assertEqual(wait['result']['status'],'completed')
+        self.assertIn('AM_HERMES',wait['result']['session_output'])
+        if model := run['result']['model']:
+            selected = call(manager,['change-model',*where,'--model',model])
+            self.assertTrue(selected.get('ok'),selected)
+            self.assertEqual(selected['result']['model'],model)
+        follow = call(manager,['steer',*where,'--prompt','Repeat the word I asked you to remember. Do not use tools.',
+                               '--seconds','40'],85)
+        self.assertTrue(follow.get('ok'),follow)
+        self.assertEqual(follow['result']['thread_id'],run['result']['thread_id'])
+        self.assertNotEqual(follow['result']['turn_id'],run['result']['turn_id'])
+        self.assertIn('JUNIPER',follow['result']['session_output'])
+
+    @unittest.skipUnless(os.getenv('AGENT_MANAGER_LIVE') == '1','requires real local Herdr and authenticated Codex')
+    def test_native_agent_lifecycle(self):
+        call, manager, where, workspace, temporary_home = self.fixture(agent='codex')
         model = os.environ['AGENT_MANAGER_TEST_MODEL']
         run = call(manager,['run',*where,'--cwd',str(workspace),'--agent','codex','--model',model,'--prompt','Reply with exactly AM_READY. Do not use tools.'],65)
         self.assertTrue(run.get('ok'),run)
