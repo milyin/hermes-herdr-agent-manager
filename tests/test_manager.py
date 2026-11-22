@@ -2,9 +2,13 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
+import uuid
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +44,20 @@ class Contract(unittest.TestCase):
         mod = api()
         self.assertNotEqual(mod.binding_key('first','w1','w1:p1'), mod.binding_key('second','w1','w1:p1'))
         self.assertNotEqual(mod.binding_key('first','w1','w1:p1'), mod.binding_key('first','w2','w1:p1'))
+
+    def test_binding_cleanup_failure_preserves_partial_provision(self):
+        mod = api()
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as temporary:
+            cwd = str(Path(temporary).resolve())
+            with (patch.dict(os.environ, {'HERMES_HOME':temporary}),
+                  patch.object(mod, 'pane_call', return_value={'pane_id':'w1:p2'}),
+                  patch.object(mod, 'request', return_value={'receiver': True, 'cwd':cwd}),
+                  patch.object(mod.os, 'replace', side_effect=PermissionError('binding is busy')),
+                  patch.object(Path, 'unlink', side_effect=PermissionError('cleanup is busy'))):
+                with self.assertRaises(mod.Error) as caught:
+                    mod.provision(('instance','w1'), cwd, 'agents', 'Codex')
+            self.assertEqual(caught.exception.code, 'partial_provision')
+            self.assertIn('w1:p2', str(caught.exception))
 
     def test_validation_refuses_bad_model(self):
         mod = api()
@@ -158,9 +176,8 @@ class Contract(unittest.TestCase):
             with self.assertRaises(mod.Error) as caught:
                 codex.write({'method':'turn/start'},locked)
             self.assertEqual(caught.exception.code,'user_locked')
-            os.set_blocking(reader.fileno(),False)
-            with self.assertRaises(BlockingIOError):
-                os.read(reader.fileno(),1)
+            writer.close()
+            self.assertEqual(reader.read(), b'')
 
     def test_malformed_rpc_error_is_not_a_definitive_rejection(self):
         mod = api()
@@ -185,3 +202,75 @@ class Contract(unittest.TestCase):
         with self.assertRaises(mod.Error) as caught:
             mod.read_frame(io.BytesIO(wire))
         self.assertEqual(caught.exception.code,'invalid_response')
+
+
+@unittest.skipUnless(os.name == 'nt', 'Windows transport')
+class WindowsTransport(unittest.TestCase):
+    def test_receiver_round_trip_in_isolated_python(self):
+        mod = api()
+        token = uuid.uuid4().hex + uuid.uuid4().hex
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as temporary:
+            root = Path(temporary)
+            dependency = root/'skills'/mod.SKILL
+            (dependency/'scripts').mkdir(parents=True)
+            (dependency/'SKILL.md').touch()
+            (dependency/'scripts/pane_manager.py').touch()
+            proc = subprocess.Popen([sys.executable, '-I', str(mod.HERE), '_serve', token,
+                                     str(root), 'isolated', 'w1', str(root)],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                until = time.monotonic() + 5
+                while proc.poll() is None and time.monotonic() < until:
+                    try:
+                        result = mod.request(token, 'hello')
+                        break
+                    except mod.Error as exc:
+                        self.assertEqual(exc.code, 'receiver_unavailable')
+                        time.sleep(.05)
+                else:
+                    self.fail('Windows receiver did not become ready')
+                self.assertEqual(result, {'receiver': True, 'cwd': str(root.resolve())})
+            finally:
+                if proc.poll() is None:
+                    proc.terminate()
+                proc.communicate(timeout=5)
+
+    def test_owner_only_state_directory_is_reopenable(self):
+        mod = api()
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as temporary:
+            with patch.dict(os.environ, {'HERMES_HOME':temporary}):
+                state = mod.state_dir()
+                self.assertEqual(mod.state_dir(), state)
+                self.assertTrue(state.is_dir())
+
+    def test_binding_is_private_even_without_acl_inheritance(self):
+        mod = api()
+        win = mod.windows_io()
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as temporary:
+            root = Path(temporary).resolve()
+            with win.only_user() as flags:  # Directory ACE does not descend to files.
+                self.assertTrue(win.create_directory(str(root/'agent-manager'), win.c.byref(flags)))
+            cwd = str(root)
+            scope = ('instance', 'w1')
+            with (patch.dict(os.environ, {'HERMES_HOME':cwd}),
+                  patch.object(mod, 'pane_call', return_value={'pane_id':'w1:p2'}),
+                  patch.object(mod, 'request', return_value={'receiver': True, 'cwd':cwd}),
+                  patch.object(mod, 'guard')):
+                self.assertEqual(mod.provision(scope, cwd, 'agents', 'Codex')['status'], 'ready')
+                self.assertRegex(mod.bound(scope, 'w1:p2'), r'^[0-9a-f]{64}$')
+
+    def test_owned_child_stdin_deadline_transport(self):
+        mod = api()
+        win = mod.windows_io()
+        with win.child_stdin() as (read_end, writer):
+            with subprocess.Popen([sys.executable, '-I', '-c', 'import sys; print(sys.stdin.readline().strip())'],
+                                  stdin=read_end, stdout=subprocess.PIPE) as proc:
+                self.assertEqual(writer.write(b'READY\n', time.monotonic() + 3), 6)
+                self.assertEqual(proc.communicate(timeout=5)[0].strip(), b'READY')
+
+    def test_unread_stdin_cancels_a_write_past_its_deadline(self):
+        win = api().windows_io()
+        with win.child_stdin() as (_, writer):
+            # Keep the read handle open without consuming data, above the pipe buffer size.
+            with self.assertRaises(TimeoutError):
+                writer.write(b'x' * (2 * 1024 * 1024), time.monotonic() + .1)

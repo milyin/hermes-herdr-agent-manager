@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Run a Codex app-server in a pane owned by the agent manager (Linux)."""
+"""Run a Codex app-server in a pane owned by the agent manager."""
 import argparse
+from contextlib import contextmanager, ExitStack, suppress
 from datetime import datetime, timezone
+from functools import lru_cache
 import hashlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -30,7 +34,22 @@ class Error(Exception):
 
 
 def home():
-    return Path(os.environ.get('HERMES_HOME') or Path.home() / '.hermes').absolute()
+    if override := os.environ.get('HERMES_HOME'):
+        return Path(override).expanduser().absolute()
+    if os.name == 'nt':
+        return Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData/Local') / 'hermes'
+    return Path.home() / '.hermes'
+
+
+@lru_cache(maxsize=1)
+def windows_io():
+    # -I deliberately excludes the current directory and script directory.
+    spec = importlib.util.spec_from_file_location('agent_manager_windows_io', HERE.with_name('windows_io.py'))
+    if spec is None or spec.loader is None:
+        raise Error('unsupported_platform', 'The Windows transport is missing from the skill install')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def pane_script():
@@ -44,10 +63,10 @@ def pane_script():
 
 
 def pane_call(operation, instance, workspace, *args, data=None, timeout: float=40):
-    cmd = [sys.executable, '-I', str(pane_script()), operation, '--instance', instance,
+    cmd = [sys.executable, '-I', '-B', str(pane_script()), operation, '--instance', instance,
            '--workspace', workspace, *args]
     try:
-        proc = subprocess.run(cmd, input=data, text=True, capture_output=True, timeout=timeout)
+        proc = subprocess.run(cmd, input=data, encoding='utf-8', capture_output=True, timeout=timeout)
         out = json.loads(proc.stdout)
         if not isinstance(out, dict):
             raise ValueError
@@ -68,6 +87,11 @@ def guard(instance, workspace, pane, timeout: float=40):
 
 
 def private_dir(path):
+    if os.name == 'nt':
+        try:
+            return windows_io().private_directory(path)
+        except OSError as exc:
+            raise Error('unsafe_state', 'The agent-manager state directory must be private and owned by the current user') from exc
     path.mkdir(mode=0o700, exist_ok=True)
     info = path.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
@@ -90,6 +114,8 @@ def binding_file(instance, workspace, pane):
 def endpoint(token):
     if not re.fullmatch(r'[a-f0-9]{64}', token):
         raise Error('bad_binding', 'Invalid local receiver identity')
+    if os.name == 'nt':
+        return windows_io().pipe_name(hashlib.sha256(token.encode('ascii')).hexdigest())
     # Linux abstract sockets avoid the length limit of filesystem paths. Both ends check peer UID.
     return '\0hermes-agent-manager-' + token
 
@@ -99,6 +125,47 @@ def verify_peer(conn):
     _, uid, _ = struct.unpack('3i', conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
     if uid != os.getuid():
         raise Error('peer_rejected', 'Receiver IPC is restricted to the same local UID')
+
+
+@contextmanager
+def listen_channel(token):
+    if os.name == 'nt':
+        with windows_io().Listener(endpoint(token)) as listener:
+            yield listener.accept
+    else:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(endpoint(token))
+            server.listen(8)
+            yield lambda: server.accept()[0]
+
+
+@contextmanager
+def connect_channel(token):
+    if os.name == 'nt':
+        with windows_io().client(endpoint(token)) as conn:
+            yield conn
+    else:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(3)
+            conn.connect(endpoint(token))
+            verify_peer(conn)
+            yield conn
+
+
+def read_channel(conn, seconds):
+    if os.name == 'nt':
+        return read_frame(io.BytesIO(conn.line(MAX_FRAME + 1, time.monotonic() + seconds)))
+    conn.settimeout(seconds)
+    with conn.makefile('rb') as stream:
+        return read_frame(stream)
+
+
+def send_channel(conn, data, seconds):
+    if os.name == 'nt':
+        conn.send(data, time.monotonic() + seconds)
+    else:
+        conn.settimeout(seconds)
+        conn.sendall(data)
 
 
 def frame(value):
@@ -174,9 +241,20 @@ def quota(response):
     return {'source':'codex_account_rate_limits', 'primary':window('primary'), 'secondary':window('secondary')}
 
 
+def codex_binary():
+    if os.name == 'nt':
+        # Do not load a project-local executable or invoke npm's batch shim.
+        for entry in os.get_exec_path():
+            directory = Path(entry.strip('"'))
+            if directory.is_absolute() and (directory/'codex.exe').is_file():
+                return str(directory/'codex.exe')
+        return None
+    return shutil.which('codex')
+
+
 class Codex:
     def __init__(self, cwd, check=None):
-        binary = shutil.which('codex')
+        binary = codex_binary()
         if not binary:
             raise Error('codex_missing', 'Install and authenticate Codex before using this skill')
         self.condition = threading.Condition()
@@ -186,19 +264,29 @@ class Codex:
         self.turns = {}
         self.sequence = 0
         self.dead = False
-        self.proc = subprocess.Popen([str(Path(binary).resolve()), '-c', 'features.fast_mode=false',
-                                      'app-server', '--listen', 'stdio://'], cwd=cwd,
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None)
+        self.windows_stdin = None
+        self.io_stack = ExitStack()
         try:
-            assert self.proc.stdin is not None
-            os.set_blocking(self.proc.stdin.fileno(),False)
+            command = [str(Path(binary).resolve()), '-c', 'features.fast_mode=false',
+                       'app-server', '--listen', 'stdio://']
+            if os.name == 'nt':
+                child_read, self.windows_stdin = self.io_stack.enter_context(windows_io().child_stdin())
+                self.proc = subprocess.Popen(command, cwd=cwd, stdin=child_read, stdout=subprocess.PIPE)
+                child_read.close()  # The subprocess owns its duplicate.
+            else:
+                self.proc = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                assert self.proc.stdin is not None
+                os.set_blocking(self.proc.stdin.fileno(), False)
             threading.Thread(target=self.listen, daemon=True).start()
             self.rpc('initialize', {'clientInfo':{'name':'hermes_herdr_agent_manager','title':'Hermes Herdr Agent Manager','version':'0.1.0'}},check)
             self.write({'method':'initialized'},check)
         except BaseException:
-            if self.proc.poll() is None:
-                self.proc.terminate()
-            self.dispose()
+            if hasattr(self, 'proc'):
+                if self.proc.poll() is None:
+                    self.proc.terminate()
+                self.dispose()
+            else:
+                self.io_stack.close()
             raise
 
     def exited(self):
@@ -212,6 +300,7 @@ class Codex:
             self.proc.wait(timeout=3)
         if self.proc.stdin is not None:
             self.proc.stdin.close()
+        self.io_stack.close()
 
     def stop_unassigned(self):
         if not self.exited():
@@ -228,8 +317,7 @@ class Codex:
             if self.write_poisoned:
                 raise Error('outcome_unknown','A prior frame was partially written; do not send more input')
             try:
-                assert self.proc.stdin is not None
-                fd = self.proc.stdin.fileno()
+                win_pipe = getattr(self, 'windows_stdin', None)
                 while data:
                     remaining = deadline-time.monotonic()
                     if remaining <= 0:
@@ -242,12 +330,22 @@ class Codex:
                                 deadline = min(deadline,request_deadline)
                             if time.monotonic() >= deadline:
                                 raise Error('deadline_elapsed','Lock verification finished after the write deadline')
-                        size = os.write(fd,data)
+                        if win_pipe is not None:
+                            started = True  # An overlapped write can have partially reached Codex.
+                            size = win_pipe.write(data, deadline)
+                        else:
+                            assert self.proc.stdin is not None
+                            size = os.write(self.proc.stdin.fileno(), data)
                     except BlockingIOError:
-                        select.select([],[fd],[],max(0,deadline-time.monotonic()))
+                        assert self.proc.stdin is not None
+                        select.select([],[self.proc.stdin.fileno()],[],max(0,deadline-time.monotonic()))
                     else:
                         started = True
+                        if size <= 0:
+                            raise Error('outcome_unknown', 'Codex stdin made no progress; do not replay')
                         data = data[size:]
+            except TimeoutError as exc:
+                raise Error('outcome_unknown', 'Timed out writing to Codex; inspect the prior turn before retrying') from exc
             except OSError as exc:
                 raise Error('codex_disconnected', 'Codex disconnected; reconcile before any retry') from exc
         except BaseException:
@@ -503,10 +601,9 @@ def serve(token, cwd, scope):
     def handle(conn):
         with conn:
             try:
-                conn.settimeout(5)
-                verify_peer(conn)
-                with conn.makefile('rb') as stream:
-                    packet = read_frame(stream)
+                if os.name != 'nt':
+                    verify_peer(conn)
+                packet = read_channel(conn, 5)
                 raw_deadline = packet.get('deadline')
                 if not isinstance(raw_deadline,(float,int)) or isinstance(raw_deadline,bool):
                     raise Error('deadline_elapsed', 'Receiver request had no valid deadline')
@@ -534,17 +631,15 @@ def serve(token, cwd, scope):
             except (ValueError, OSError, AttributeError, KeyError, TypeError):
                 result = {'ok':False,'error':{'code':'protocol_error','message':'Request failed verification; do not blindly retry'}}
             try:
-                conn.sendall(frame(result))
+                send_channel(conn, frame(result), 5)
             except (OSError, Error):
                 pass
             finally:
                 slots.release()
-    with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as server:
-        server.bind(endpoint(token))
-        server.listen(8)
+    with listen_channel(token) as accept:
         print('Hermes Herdr Agent Manager ready', flush=True)
         while True:
-            conn,_ = server.accept()
+            conn = accept()
             if not slots.acquire(blocking=False):
                 conn.close()
                 continue
@@ -554,16 +649,12 @@ def serve(token, cwd, scope):
 def request(token, op, **fields):
     sent = False
     try:
-        with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as conn:
-            conn.settimeout(3)
-            conn.connect(endpoint(token))
-            verify_peer(conn)
+        with connect_channel(token) as conn:
             deadline = time.monotonic()+(5 if op=='hello' else 65)
-            conn.settimeout(fields.get('seconds',0)+70)
+            wire = frame(dict(op=op,deadline=deadline,**fields))
             sent = True
-            conn.sendall(frame(dict(op=op,deadline=deadline,**fields)))
-            with conn.makefile('rb') as stream:
-                result = read_frame(stream)
+            send_channel(conn, wire, 5)
+            result = read_channel(conn, fields.get('seconds',0)+70)
     except (OSError, Error) as exc:
         raise Error('outcome_unknown' if sent else 'receiver_unavailable',
                     'No verified receiver reply; inspect state before retrying') from exc
@@ -586,7 +677,7 @@ def provision(scope: tuple[str, str], cwd, group, suffix):
     cwd = cwd_path(cwd)
     cwd_state = state_dir()
     result = pane_call('create',*scope,'--cwd',cwd,'--group',group,'--suffix',suffix,'--argv-stdin',
-                       data=json.dumps([sys.executable,'-I',str(HERE),'_serve',token,cwd,*scope,str(home())]))
+                       data=json.dumps([sys.executable,'-I','-B',str(HERE),'_serve',token,cwd,*scope,str(home())]))
     pane = result.get('pane_id')
     if not isinstance(pane,str) or not pane:
         raise Error('outcome_unknown','Pane manager did not identify the provisioned pane')
@@ -604,22 +695,37 @@ def provision(scope: tuple[str, str], cwd, group, suffix):
     record = {'token':token,'scope':[*scope,pane]}
     target = cwd_state / (binding_key(*scope,pane) + '.json')
     pending = cwd_state / (token + '.tmp')
+    created = False
     try:
-        with os.fdopen(os.open(pending,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600),'w') as stream:
+        if os.name == 'nt':
+            file = windows_io().create_state_file(pending)
+        else:
+            file = os.fdopen(os.open(pending, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), 'w', encoding='utf-8')
+        created = True
+        with file as stream:
             json.dump(record,stream)
         os.replace(pending,target)
+    except OSError as exc:
+        raise Error('partial_provision', f'Pane {pane} exists; binding was not saved. Do not create a duplicate blindly') from exc
     finally:
-        pending.unlink(missing_ok=True)
+        if created:
+            with suppress(OSError):
+                pending.unlink(missing_ok=True)
     return {'pane_id':pane,'cwd':cwd,'status':'ready'}
 
 
 def bound(scope: tuple[str, str], pane, timeout: float=40):
     target = binding_file(*scope,pane)
     try:
-        with os.fdopen(os.open(target,os.O_RDONLY|os.O_NOFOLLOW),'r') as stream:
-            info = os.fstat(stream.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-                raise Error('bad_binding','Agent-manager binding is not private')
+        if os.name == 'nt':
+            file = windows_io().read_state_file(target)
+        else:
+            file = os.fdopen(os.open(target, os.O_RDONLY | os.O_NOFOLLOW), 'r', encoding='utf-8')
+        with file as stream:
+            if os.name != 'nt':
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+                    raise Error('bad_binding','Agent-manager binding is not private')
             value = json.load(stream)
     except (OSError, ValueError) as exc:
         raise Error('unowned_pane','Provision a pane using this skill; arbitrary shells and agents cannot be adopted') from exc
@@ -665,8 +771,8 @@ def main():
     internal.add_argument('profile_home')
     a=parser.parse_args()
     try:
-        if not sys.platform.startswith('linux'):
-            raise Error('unsupported_platform','The agent-manager receiver currently requires Linux')
+        if os.name != 'nt' and not sys.platform.startswith('linux'):
+            raise Error('unsupported_platform','The agent-manager receiver requires Windows or Linux')
         if a.op == '_serve':
             os.environ['HERMES_HOME'] = a.profile_home
             pane_script()
@@ -702,4 +808,5 @@ def main():
 
 
 if __name__ == '__main__':
+    sys.dont_write_bytecode = True
     sys.exit(main())
