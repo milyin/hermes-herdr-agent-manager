@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Run a Codex app-server in a pane owned by the agent manager."""
+"""Run Codex or Hermes Agent in a pane owned by the agent manager."""
 import argparse
-from contextlib import contextmanager, ExitStack, suppress
+from contextlib import contextmanager, ExitStack, nullcontext, suppress
 from datetime import datetime, timezone
 from functools import lru_cache
 import hashlib
@@ -22,6 +22,7 @@ import time
 import uuid
 
 SKILL = 'hermes-herdr-pane-manager'
+AGENTS = ('codex', 'hermes')
 MAX_FRAME = 1024 * 1024
 MAX_PROMPT = 32768
 HERE = Path(__file__).resolve()
@@ -197,9 +198,10 @@ def read_frame(stream):
     return value
 
 
-def validate_model(name):
-    if not isinstance(name, str) or not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}', name):
-        raise Error('invalid_model', 'Supply an explicit Codex model ID')
+def validate_model(name, *, hermes=False):
+    pattern = r'[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,191}' if hermes else r'[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}'
+    if not isinstance(name, str) or not re.fullmatch(pattern, name):
+        raise Error('invalid_model', 'Supply a valid model ID')
     return name
 
 
@@ -241,22 +243,24 @@ def quota(response):
     return {'source':'codex_account_rate_limits', 'primary':window('primary'), 'secondary':window('secondary')}
 
 
-def codex_binary():
+def agent_binary(name):
+    # Do not load project-local executables, relative PATH entries, or batch shims.
+    entries = [entry.strip('"') for entry in os.get_exec_path()]
+    path = os.pathsep.join(entry for entry in entries if Path(entry).is_absolute())
     if os.name == 'nt':
-        # Do not load a project-local executable or invoke npm's batch shim.
-        for entry in os.get_exec_path():
-            directory = Path(entry.strip('"'))
-            if directory.is_absolute() and (directory/'codex.exe').is_file():
-                return str(directory/'codex.exe')
+        for entry in path.split(os.pathsep):
+            if entry and (binary := Path(entry) / (name + '.exe')).is_file():
+                return str(binary.resolve())
         return None
-    return shutil.which('codex')
+    return shutil.which(name, path=path) if path else None
 
 
-class Codex:
-    def __init__(self, cwd, check=None):
-        binary = codex_binary()
-        if not binary:
-            raise Error('codex_missing', 'Install and authenticate Codex before using this skill')
+class ChildRpc:
+    label = 'Agent'
+    kind = 'agent'
+    version = {}
+
+    def __init__(self, cwd, command, *, env=None):
         self.condition = threading.Condition()
         self.write_lock = threading.Lock()
         self.write_poisoned = False
@@ -267,19 +271,16 @@ class Codex:
         self.windows_stdin = None
         self.io_stack = ExitStack()
         try:
-            command = [str(Path(binary).resolve()), '-c', 'features.fast_mode=false',
-                       'app-server', '--listen', 'stdio://']
             if os.name == 'nt':
                 child_read, self.windows_stdin = self.io_stack.enter_context(windows_io().child_stdin())
-                self.proc = subprocess.Popen(command, cwd=cwd, stdin=child_read, stdout=subprocess.PIPE)
+                self.proc = subprocess.Popen(command, cwd=cwd, stdin=child_read, stdout=subprocess.PIPE, env=env)
                 child_read.close()  # The subprocess owns its duplicate.
             else:
-                self.proc = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                self.proc = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=env)
                 assert self.proc.stdin is not None
                 os.set_blocking(self.proc.stdin.fileno(), False)
-            threading.Thread(target=self.listen, daemon=True).start()
-            self.rpc('initialize', {'clientInfo':{'name':'hermes_herdr_agent_manager','title':'Hermes Herdr Agent Manager','version':'0.1.0'}},check)
-            self.write({'method':'initialized'},check)
+            self.reader = threading.Thread(target=self.listen, daemon=True)
+            self.reader.start()
         except BaseException:
             if hasattr(self, 'proc'):
                 if self.proc.poll() is None:
@@ -301,6 +302,10 @@ class Codex:
         if self.proc.stdin is not None:
             self.proc.stdin.close()
         self.io_stack.close()
+        if hasattr(self, 'reader'):
+            self.reader.join(timeout=1)
+            if not self.reader.is_alive() and self.proc.stdout is not None:
+                self.proc.stdout.close()
 
     def stop_unassigned(self):
         if not self.exited():
@@ -309,9 +314,9 @@ class Codex:
 
     def write(self, msg, check=None, deadline=None):
         deadline = time.monotonic()+15 if deadline is None else deadline
-        data = memoryview(frame(msg))
+        data = memoryview(frame({**self.version, **msg}))
         if not self.write_lock.acquire(timeout=max(0,deadline-time.monotonic())):
-            raise Error('deadline_elapsed','Timed out before writing to Codex')
+            raise Error('deadline_elapsed',f'Timed out before writing to {self.label}')
         started = False
         try:
             if self.write_poisoned:
@@ -322,7 +327,7 @@ class Codex:
                     remaining = deadline-time.monotonic()
                     if remaining <= 0:
                         code = 'outcome_unknown' if started else 'deadline_elapsed'
-                        raise Error(code,'Timed out writing to Codex; inspect the prior turn before retrying')
+                        raise Error(code,f'Timed out writing to {self.label}; inspect the prior turn before retrying')
                     try:
                         if not started and check is not None:
                             request_deadline = check(deadline)
@@ -330,24 +335,29 @@ class Codex:
                                 deadline = min(deadline,request_deadline)
                             if time.monotonic() >= deadline:
                                 raise Error('deadline_elapsed','Lock verification finished after the write deadline')
-                        if win_pipe is not None:
-                            started = True  # An overlapped write can have partially reached Codex.
-                            size = win_pipe.write(data, deadline)
-                        else:
-                            assert self.proc.stdin is not None
-                            size = os.write(self.proc.stdin.fileno(), data)
+                        with (nullcontext() if started else self.write_fence(msg)):
+                            # The approval fence can block after pane verification, including
+                            # on Windows where an expired overlapped write could still complete.
+                            if not started and time.monotonic() >= deadline:
+                                raise Error('deadline_elapsed', 'The write deadline expired before the agent received input')
+                            if win_pipe is not None:
+                                started = True  # An overlapped write can have partially reached the child.
+                                size = win_pipe.write(data, deadline)
+                            else:
+                                assert self.proc.stdin is not None
+                                size = os.write(self.proc.stdin.fileno(), data)
                     except BlockingIOError:
                         assert self.proc.stdin is not None
                         select.select([],[self.proc.stdin.fileno()],[],max(0,deadline-time.monotonic()))
                     else:
                         started = True
                         if size <= 0:
-                            raise Error('outcome_unknown', 'Codex stdin made no progress; do not replay')
+                            raise Error('outcome_unknown', f'{self.label} stdin made no progress; do not replay')
                         data = data[size:]
             except TimeoutError as exc:
-                raise Error('outcome_unknown', 'Timed out writing to Codex; inspect the prior turn before retrying') from exc
+                raise Error('outcome_unknown', f'Timed out writing to {self.label}; inspect the prior turn before retrying') from exc
             except OSError as exc:
-                raise Error('codex_disconnected', 'Codex disconnected; reconcile before any retry') from exc
+                raise Error(f'{self.kind}_disconnected', f'{self.label} disconnected; reconcile before any retry') from exc
         except BaseException:
             if started and data:
                 self.write_poisoned = True
@@ -355,20 +365,27 @@ class Codex:
         finally:
             self.write_lock.release()
 
+    @contextmanager
+    def write_fence(self, msg):
+        yield
+
     def listen(self):
         try:
             assert self.proc.stdout is not None
             while True:
                 event = read_frame(self.proc.stdout)
+                if self.version and event.get('jsonrpc') != '2.0':
+                    raise Error('invalid_response', 'Expected a JSON-RPC 2.0 frame')
                 if 'method' in event and 'id' in event:
-                    # Never approve server-initiated requests: human approval is not proxied here.
-                    self.write({'id':event['id'],'error':{'code':-32000,'message':'No permission was granted by the operator'}})
+                    self.server_request(event)
                     continue
                 with self.condition:
                     if 'id' in event:
                         ident = event['id']
                         if type(ident) is int and ident in self.replies:
                             self.replies[ident] = event
+                        else:
+                            self.capture_reply(event)
                     else:
                         self.capture(event)
                     self.condition.notify_all()
@@ -378,6 +395,62 @@ class Codex:
             with self.condition:
                 self.dead = True
                 self.condition.notify_all()
+
+    def server_request(self, event):
+        self.write({'id':event['id'],'error':{'code':-32000,'message':'No permission was granted by the operator'}})
+
+    def capture_reply(self, event):
+        pass
+
+    def capture(self, event):
+        raise NotImplementedError
+
+    def wait(self, thread, turn, seconds):
+        raise NotImplementedError
+
+    def rpc(self, method, params, check=None, *, timeout=15):
+        deadline = time.monotonic()+timeout
+        with self.condition:
+            if self.dead:
+                raise Error(f'{self.kind}_disconnected', f'{self.label} is no longer connected; no work will be replayed')
+            self.sequence += 1
+            ident = self.sequence
+            self.replies[ident] = None
+        try:
+            self.write({'id':ident,'method':method,'params':params},check,deadline)
+            with self.condition:
+                self.condition.wait_for(lambda: self.replies[ident] is not None or self.dead, timeout=max(0,deadline-time.monotonic()))
+                data = self.replies[ident]
+            if data is None:
+                raise Error('outcome_unknown', f'No verified {method} result; do not repeat the request blindly')
+            if 'error' in data:
+                failure = data['error']
+                if 'result' in data or not isinstance(failure,dict) or type(failure.get('code')) is not int or not isinstance(failure.get('message'),str):
+                    raise Error('invalid_response', f'Ambiguous error envelope from {method}')
+                raise Error(f'{self.kind}_rejected', f'{self.label} refused {method}')
+            if not isinstance(data.get('result'), dict):
+                raise Error('invalid_response', f'Unexpected result from {method}')
+            return data['result']
+        finally:
+            with self.condition:
+                self.replies.pop(ident, None)
+
+
+class Codex(ChildRpc):
+    label = 'Codex'
+    kind = 'codex'
+
+    def __init__(self, cwd, check=None):
+        binary = agent_binary('codex')
+        if not binary:
+            raise Error('codex_missing', 'Install and authenticate Codex before using this skill')
+        super().__init__(cwd, [binary, '-c', 'features.fast_mode=false', 'app-server', '--listen', 'stdio://'])
+        try:
+            self.rpc('initialize', {'clientInfo':{'name':'hermes_herdr_agent_manager','title':'Hermes Herdr Agent Manager','version':'0.1.0'}},check)
+            self.write({'method':'initialized'},check)
+        except BaseException:
+            self.stop_unassigned()
+            raise
 
     def capture(self, event):
         params = event.get('params')
@@ -405,33 +478,6 @@ class Codex:
             if code in ('modelNotFound','usageLimitExceeded','authenticationFailed','sandboxError','serverOverloaded'):
                 row['error_code'] = code
 
-    def rpc(self, method, params, check=None):
-        deadline = time.monotonic()+15
-        with self.condition:
-            if self.dead:
-                raise Error('codex_disconnected', 'Codex is no longer connected; no work will be replayed')
-            self.sequence += 1
-            ident = self.sequence
-            self.replies[ident] = None
-        try:
-            self.write({'id':ident,'method':method,'params':params},check,deadline)
-            with self.condition:
-                self.condition.wait_for(lambda: self.replies[ident] is not None or self.dead, timeout=max(0,deadline-time.monotonic()))
-                data = self.replies[ident]
-            if data is None:
-                raise Error('outcome_unknown', f'No verified {method} result; do not repeat the request blindly')
-            if 'error' in data:
-                failure = data['error']
-                if 'result' in data or not isinstance(failure,dict) or type(failure.get('code')) is not int or not isinstance(failure.get('message'),str):
-                    raise Error('invalid_response', f'Ambiguous error envelope from {method}')
-                raise Error('codex_rejected', f'Codex refused {method}')
-            if not isinstance(data.get('result'), dict):
-                raise Error('invalid_response', f'Unexpected result from {method}')
-            return data['result']
-        finally:
-            with self.condition:
-                self.replies.pop(ident, None)
-
     def state(self, thread, turn):
         with self.condition:
             return dict(self.turns.get((thread,turn), {}))
@@ -451,7 +497,167 @@ class Codex:
         return dict(thread_id=thread, turn_id=turn, answer=row['answer'])
 
 
+class HermesAcp(ChildRpc):
+    label = 'Hermes'
+    kind = 'hermes'
+    version = {'jsonrpc': '2.0'}
+
+    def __init__(self, cwd, check, *, command=None):
+        if command is None:
+            binary = agent_binary('hermes')
+            if binary is None:
+                raise Error('hermes_missing', 'Put a native Hermes launcher with ACP support on the Herdr server PATH')
+            command = [binary, 'acp']
+        env = os.environ.copy()
+        for name in ('HERMES_YOLO', 'HERMES_YOLO_MODE', 'HERMES_ACCEPT_HOOKS'):
+            env.pop(name, None)
+        self.session = None
+        self.task = None
+        self.blocked = False
+        self.approval_note = 'denial was not confirmed'
+        super().__init__(cwd, command, env=env)
+        try:
+            result = self.rpc('initialize', {'protocolVersion': 1, 'clientCapabilities': {},
+                'clientInfo': {'name': 'hermes-herdr-agent-manager', 'version': '0.3.0'}}, check, timeout=25)
+            if type(result.get('protocolVersion')) is not int or result['protocolVersion'] != 1:
+                raise Error('hermes_incompatible', 'Hermes did not negotiate ACP version 1')
+        except BaseException:
+            self.stop_unassigned()
+            raise
+
+    def open_session(self, cwd, check):
+        result = self.rpc('session/new', {'cwd': cwd, 'mcpServers': []}, check, timeout=35)
+        ident = result.get('sessionId')
+        if not isinstance(ident, str) or not ident or len(ident) > 256:
+            raise Error('invalid_response', 'Hermes did not identify the new ACP session')
+        self.session = ident
+        models = result.get('models')
+        current = models.get('currentModelId') if isinstance(models, dict) else None
+        return ident, current if isinstance(current, str) else None
+
+    @contextmanager
+    def write_fence(self, msg):
+        if msg.get('method') in ('session/new', 'session/prompt', 'session/set_model'):
+            # Lock order is write_lock -> condition. Recheck after the potentially slow pane guard,
+            # and serialize the first write with the approval latch. Replies bypass this fence.
+            with self.condition:
+                self.require_available()
+                yield
+        else:
+            yield
+
+    def server_request(self, event):
+        # No operator approval or host capability is proxied. Latch before replying
+        # so a subsequent caller cannot continue an approval-blocked session.
+        with self.condition:
+            self.blocked = True
+            self.approval_note = 'denial was not confirmed'
+            self.condition.notify_all()
+        if event['method'] == 'session/request_permission':
+            params = event.get('params')
+            options = params.get('options') if isinstance(params, dict) and self.session and params.get('sessionId') == self.session else None
+            outcome = {'outcome': 'cancelled'}
+            if isinstance(options, list) and len(options) <= 128 and all(isinstance(option, dict) for option in options):
+                ids = [option.get('optionId') for option in options]
+                for option, ident in zip(options, ids):
+                    if (option.get('kind') == 'reject_once' and isinstance(ident, str)
+                            and 0 < len(ident) <= 256 and ids.count(ident) == 1):
+                        outcome = {'outcome': 'selected', 'optionId': ident}
+                        break
+            self.write({'id': event['id'], 'result': {'outcome': outcome}})
+            if outcome['outcome'] == 'selected':
+                with self.condition:
+                    self.approval_note = 'explicit rejection was sent; check settlement in Hermes'
+        else:
+            super().server_request(event)
+
+    def approval_error(self):
+        return Error('approval_required', f'Hermes requested operator input; no permission was granted ({self.approval_note})')
+
+    def require_available(self, *, idle=False):
+        with self.condition:
+            if self.blocked:
+                raise self.approval_error()
+            if self.dead or (self.task and self.task['status'] == 'unknown'):
+                raise Error('outcome_unknown', 'Hermes session outcome is not verified; inspect it in Hermes, do not replay')
+            if idle and self.task and self.task['status'] is None:
+                raise Error('turn_active', 'Wait for the current Hermes turn before sending another operation')
+
+    def submit(self, prompt, check):
+        with self.condition:
+            self.require_available(idle=True)
+            self.sequence += 1
+            ident = self.sequence
+            turn = uuid.uuid4().hex
+            previous = self.task
+            self.task = {'rpc_id': ident, 'turn': turn, 'status': None, 'text': '', 'bytes': 0}
+        try:
+            self.write({'id': ident, 'method': 'session/prompt', 'params': {
+                'sessionId': self.session, 'prompt': [{'type': 'text', 'text': prompt}]}}, check)
+        except Error as exc:
+            with self.condition:
+                if exc.code in ('outcome_unknown', 'hermes_disconnected'):
+                    assert self.task is not None
+                    self.task['status'] = 'unknown'
+                else:
+                    self.task = previous
+                self.condition.notify_all()
+            raise
+        return turn
+
+    def capture(self, event):
+        row = self.task
+        params = event.get('params')
+        if (not row or row['status'] is not None or event.get('method') != 'session/update'
+                or not isinstance(params, dict) or params.get('sessionId') != self.session):
+            return
+        update = params.get('update')
+        if not isinstance(update, dict) or update.get('sessionUpdate') != 'agent_message_chunk':
+            return
+        content = update.get('content')
+        text = content.get('text') if isinstance(content, dict) and content.get('type') == 'text' else None
+        if isinstance(text, str) and row['bytes'] <= MAX_FRAME // 2:
+            row['bytes'] += len(json.dumps(text, ensure_ascii=True))
+            if row['bytes'] <= MAX_FRAME // 2:
+                row['text'] += text
+
+    def capture_reply(self, event):
+        row = self.task
+        if not row or type(event.get('id')) is not int or event['id'] != row['rpc_id'] or row['status'] is not None:
+            return
+        result = event.get('result')
+        stop = result.get('stopReason') if isinstance(result, dict) and 'error' not in event else None
+        if stop == 'end_turn':
+            row['status'] = 'completed'
+        elif stop in ('cancelled', 'max_tokens', 'max_turn_requests', 'refusal'):
+            row['status'] = 'failed'
+        else:
+            # ACP errors may represent a lost gateway admission, not a clean rejection.
+            row['status'] = 'unknown'
+
+    def wait(self, thread, turn, seconds):
+        with self.condition:
+            row = self.task
+            if not row or row['turn'] != turn or thread != self.session:
+                raise Error('unknown_turn', 'Only the latest Hermes turn in this receiver can be read')
+            self.condition.wait_for(lambda: row['status'] is not None or self.blocked or self.dead, timeout=seconds)
+            if self.blocked:
+                raise self.approval_error()
+            if row['status'] == 'failed':
+                raise Error('turn_failed', f'Hermes turn {turn} did not complete normally; no automatic replay')
+            if row['status'] != 'completed':
+                code = 'outcome_unknown' if self.dead or row['status'] == 'unknown' else 'turn_pending'
+                raise Error(code, f'Hermes turn {turn} has no verified final result; do not resend')
+            if not row['text'] or row['bytes'] > MAX_FRAME // 2:
+                raise Error('answer_unavailable', 'Hermes finished without complete, bounded session output')
+            # ACP v1 identifies the completion by request ID, but assistant chunks only
+            # by session. Do not present session-wide output as this admission's answer.
+            return dict(thread_id=thread, turn_id=turn, status='completed', session_output=row['text'])
+
+
 class Receiver:
+    agent = 'codex'
+
     def __init__(self, cwd):
         self.cwd = cwd
         self.codex = None
@@ -497,10 +703,13 @@ class Receiver:
     def dispatch(self, packet, check=lambda _deadline=None: None):
         op = packet.get('op')
         if op == 'hello':
-            return {'receiver':True, 'cwd':self.cwd}
+            receipt = {'receiver':True, 'cwd':self.cwd}
+            return receipt if self.agent == 'codex' else dict(receipt, agent=self.agent)
+        if op in ('run', 'quota') and packet.get('agent', 'codex') != self.agent:
+            raise Error('agent_mismatch', f'This pane is provisioned for {self.agent}; use a pane for the requested agent')
         if op == 'wait':
             with self.mutation:
-                backend, thread, turn = self.codex, self.thread, self.turn
+                backend, thread, turn = self.active_backend(), self.thread, self.turn
             if backend is None or not turn or packet.get('turn_id') != turn:
                 raise Error('unknown_turn', 'Only the latest confirmed turn in this receiver can be read')
             return backend.wait(thread, turn, packet['seconds'])
@@ -508,9 +717,9 @@ class Receiver:
             raise Error('receiver_busy', 'Another operation is in progress; inspect before retrying')
         try:
             reply = self.apply(op, packet, check)
-            backend = self.codex
+            backend = self.active_backend()
         except Error as exc:
-            if op in ('run','steer') and exc.code in ('outcome_unknown','invalid_response','codex_disconnected'):
+            if op in ('run','steer') and exc.code in ('outcome_unknown','invalid_response','codex_disconnected','hermes_disconnected'):
                 self.uncertain = True
             raise
         finally:
@@ -519,6 +728,9 @@ class Receiver:
             assert backend is not None
             return backend.wait(reply['thread_id'],reply['turn_id'],packet['seconds'])
         return reply
+
+    def active_backend(self) -> ChildRpc | None:
+        return self.codex
 
     def apply(self, op, packet, check):
         if op == 'quota':
@@ -595,8 +807,74 @@ class Receiver:
         raise Error('invalid_operation', 'Unknown receiver operation')
 
 
-def serve(token, cwd, scope):
-    receiver = Receiver(cwd)
+class HermesReceiver(Receiver):
+    agent = 'hermes'
+
+    def __init__(self, cwd):
+        super().__init__(cwd)
+        self.acp = None
+
+    def active_backend(self) -> ChildRpc | None:
+        return self.acp
+
+    def apply(self, op, packet, check):
+        if op in ('quota', 'recover'):
+            raise Error('unsupported_operation', f'{op} is not implemented for Hermes ACP; use the Hermes CLI or UI')
+        if self.acp is not None:
+            self.acp.require_available(idle=True)
+        if self.uncertain:
+            raise Error('outcome_unknown', 'A prior Hermes mutation could not be reconciled; no automatic replay')
+        if op == 'steer' and packet.get('expected_turn') is not None:
+            raise Error('unsupported_operation', 'Hermes ACP supports idle follow-ups, not exact active-turn steering')
+        prompt = packet.get('prompt')
+        if op in ('run', 'steer'):
+            text_input(prompt)
+            if prompt.lstrip().startswith('/'):
+                raise Error('unsupported_prompt', 'Hermes ACP slash commands are not forwarded as prompts')
+        if op == 'run':
+            if packet.get('cwd') != self.cwd:
+                raise Error('cwd_mismatch', 'Working directory must match the owned pane provisioning directory')
+            if self.thread is not None:
+                raise Error('already_started', 'Use steer to follow up in the existing Hermes session')
+            if packet.get('network'):
+                raise Error('unsupported_operation', '--network is Codex-only; Hermes uses its profile tool policy')
+            requested = packet.get('model')
+            if requested is not None:
+                validate_model(requested, hermes=True)
+            if self.acp is None:
+                check()
+                self.acp = HermesAcp(self.cwd, check)
+            self.thread, self.model = self.acp.open_session(self.cwd, check)
+            if requested is not None and requested != self.model:
+                self.set_model(requested, check)
+            print('Hermes ACP session ready', flush=True)
+        elif self.acp is None or self.thread is None:
+            raise Error('not_running', 'Run Hermes in this pane first')
+        elif op == 'change-model':
+            self.set_model(packet.get('model'), check)
+            return dict(model=self.model, applies='next_turn')
+        elif op != 'steer':
+            raise Error('invalid_operation', 'Unknown receiver operation')
+        assert self.acp is not None and isinstance(prompt, str)
+        self.turn = self.acp.submit(prompt, check)
+        return dict(thread_id=self.thread, turn_id=self.turn, model=self.model, status='submitted')
+
+    def set_model(self, model, check):
+        assert self.acp is not None
+        model = validate_model(model, hermes=True)
+        try:
+            self.acp.rpc('session/set_model', {'sessionId':self.thread, 'modelId':model}, check)
+        except Error as exc:
+            if exc.code in ('outcome_unknown', 'invalid_response', 'hermes_disconnected'):
+                self.uncertain = True
+            self.acp.require_available()
+            raise
+        self.acp.require_available()
+        self.model = model
+
+
+def serve(token, cwd, scope, agent='codex'):
+    receiver = HermesReceiver(cwd) if agent == 'hermes' else Receiver(cwd)
     slots = threading.BoundedSemaphore(8)
     def handle(conn):
         with conn:
@@ -672,12 +950,15 @@ def receiver_result(result):
     raise Error('outcome_unknown','Malformed receiver receipt; inspect state before retrying')
 
 
-def provision(scope: tuple[str, str], cwd, group, suffix):
+def provision(scope: tuple[str, str], cwd, group, suffix, agent='codex'):
     token = uuid.uuid4().hex + uuid.uuid4().hex
     cwd = cwd_path(cwd)
     cwd_state = state_dir()
+    launch = [sys.executable,'-I','-B',str(HERE),'_serve',token,cwd,*scope,str(home())]
+    if agent != 'codex':
+        launch.append(agent)
     result = pane_call('create',*scope,'--cwd',cwd,'--group',group,'--suffix',suffix,'--argv-stdin',
-                       data=json.dumps([sys.executable,'-I','-B',str(HERE),'_serve',token,cwd,*scope,str(home())]))
+                       data=json.dumps(launch))
     pane = result.get('pane_id')
     if not isinstance(pane,str) or not pane:
         raise Error('outcome_unknown','Pane manager did not identify the provisioned pane')
@@ -685,14 +966,17 @@ def provision(scope: tuple[str, str], cwd, group, suffix):
     while True:
         try:
             hello = request(token,'hello')
-            if hello != {'receiver':True,'cwd':cwd}:
+            expected = {'receiver':True,'cwd':cwd}
+            if agent != 'codex':
+                expected['agent'] = agent
+            if hello != expected:
                 raise Error('bad_binding','Receiver identity did not match')
             break
         except Error as exc:
             if exc.code != 'receiver_unavailable' or time.monotonic() >= until:
                 raise Error('partial_provision', f'Pane {pane} exists; receiver was not verified. Do not create a duplicate blindly') from exc
             time.sleep(.1)
-    record = {'token':token,'scope':[*scope,pane]}
+    record = {'token':token,'scope':[*scope,pane],'agent':agent}
     target = cwd_state / (binding_key(*scope,pane) + '.json')
     pending = cwd_state / (token + '.tmp')
     created = False
@@ -711,10 +995,10 @@ def provision(scope: tuple[str, str], cwd, group, suffix):
         if created:
             with suppress(OSError):
                 pending.unlink(missing_ok=True)
-    return {'pane_id':pane,'cwd':cwd,'status':'ready'}
+    return {'pane_id':pane,'cwd':cwd,'agent':agent,'status':'ready'}
 
 
-def bound(scope: tuple[str, str], pane, timeout: float=40):
+def bound(scope: tuple[str, str], pane, timeout: float=40, *, agent=None):
     target = binding_file(*scope,pane)
     try:
         if os.name == 'nt':
@@ -731,6 +1015,9 @@ def bound(scope: tuple[str, str], pane, timeout: float=40):
         raise Error('unowned_pane','Provision a pane using this skill; arbitrary shells and agents cannot be adopted') from exc
     if not isinstance(value,dict) or value.get('scope') != [*scope,pane] or not isinstance(value.get('token'),str):
         raise Error('bad_binding','Cannot verify this pane binding')
+    # Before agent selection existed all receipts referred exclusively to Codex.
+    if agent is not None and value.get('agent', 'codex') != agent:
+        raise Error('agent_mismatch', f'This pane was not provisioned for {agent}')
     guard(*scope,pane,timeout=timeout)
     return value['token']
 
@@ -746,13 +1033,13 @@ def main():
             p.add_argument('--pane',required=True)
         if op in ('provision','run'):
             p.add_argument('--cwd',required=True)
-        if op in ('run','get-remaining-tokens'):
-            p.add_argument('--agent',required=True,choices=('codex',))
+        if op in ('provision','run','get-remaining-tokens'):
+            p.add_argument('--agent',choices=AGENTS,required=op != 'provision',default='codex')
         if op == 'provision':
             p.add_argument('--group',default='agents')
-            p.add_argument('--suffix',default='Codex')
+            p.add_argument('--suffix')
         if op in ('run','change-model'):
-            p.add_argument('--model',required=True)
+            p.add_argument('--model',required=op == 'change-model',help='Required for Codex run; Hermes can use the profile model')
         if op == 'run':
             p.add_argument('--network',action='store_true',help='Only for explicitly authorized Codex sandbox networking')
         if op in ('run','steer'):
@@ -769,27 +1056,35 @@ def main():
     internal.add_argument('instance')
     internal.add_argument('workspace')
     internal.add_argument('profile_home')
+    internal.add_argument('agent',nargs='?',default='codex',choices=AGENTS)
     a=parser.parse_args()
+    if a.op == 'run' and a.agent == 'codex' and a.model is None:
+        parser.error('run --agent codex requires --model')
     try:
         if os.name != 'nt' and not sys.platform.startswith('linux'):
             raise Error('unsupported_platform','The agent-manager receiver requires Windows or Linux')
         if a.op == '_serve':
             os.environ['HERMES_HOME'] = a.profile_home
             pane_script()
-            serve(a.token,cwd_path(a.cwd),(a.instance,a.workspace))
+            serve(a.token,cwd_path(a.cwd),(a.instance,a.workspace),a.agent)
             return 0
         pane_script()
         scope=(a.instance,a.workspace)
         if a.op == 'provision':
-            result=provision(scope,a.cwd,a.group,a.suffix)
+            suffix = a.suffix if a.suffix is not None else {'codex':'Codex','hermes':'Hermes'}[a.agent]
+            result=provision(scope,a.cwd,a.group,suffix,a.agent)
         else:
-            token=bound(scope,a.pane)
+            token=bound(scope,a.pane,agent=getattr(a,'agent',None))
             fields={'pane':a.pane}
+            if a.op in ('run','get-remaining-tokens'):
+                fields['agent']=a.agent
             if a.op in ('run','steer'):
                 fields['prompt']=sys.stdin.buffer.read(MAX_PROMPT+1).decode() if a.prompt_stdin else a.prompt
                 text_input(fields['prompt'])
-            if a.op in ('run','change-model'):
-                fields['model']=validate_model(a.model)
+            if a.op == 'change-model':
+                fields['model']=validate_model(a.model, hermes=True)
+            if a.op == 'run' and (a.agent == 'codex' or a.model is not None):
+                fields['model']=validate_model(a.model, hermes=a.agent == 'hermes')
             if a.op == 'run':
                 fields.update(cwd=cwd_path(a.cwd),network=a.network)
             if a.op in ('steer','wait'):
