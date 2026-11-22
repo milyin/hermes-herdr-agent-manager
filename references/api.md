@@ -8,13 +8,15 @@ Prefix each command with `python -I -B <skill-directory>/scripts/agent_manager.p
 | --- | --- | --- |
 | `provision` | `--cwd ABSOLUTE_PATH` | `pane_id`, `cwd`, `agent`, `status: ready`. Optionally provide `--agent codex\|hermes` (default `codex`), `--group`, and `--suffix`. |
 | `run` | Matching `--agent codex\|hermes`, `--cwd ABSOLUTE_PATH`, and `--prompt TEXT` or `--prompt-stdin`. `--model MODEL` is required for Codex and optional for Hermes. | `thread_id`, `turn_id`, `model`, and `status: accepted` (Codex native admission) or `status: submitted` (ACP request written; outcome not yet known). |
-| `steer` | `--prompt TEXT` or `--prompt-stdin`. `--turn-id TURN_ID` is usable only for an exact, active Codex turn. | Without a turn ID, both backends support a new follow-up only after the previous turn ends. Returns the same result fields as `wait`. |
+| `steer` | `--prompt TEXT` or `--prompt-stdin`. `--turn-id TURN_ID` is only for exact active Codex steering. For an idle follow-up, pass `--thread-id THREAD_ID` and optionally `--after-turn-id TURN_ID` from the last receipt. | Both backends support idle follow-ups. A bound follow-up checks the saved IDs and idle state before submitting. Returns the same result fields as `wait`. |
 | `change-model` | `--model MODEL` | `model`, `applies: next_turn`. Rejected while a turn is active. Codex applies the override on the next submission; Hermes calls its ACP model setter. Hermes accepts `provider:model` IDs or model IDs understood by its ACP server. |
 | `get-remaining-tokens` | `--agent codex` | Codex only. Account rate-limit windows `primary` and `secondary`, each with `remaining_percent`, `window_minutes`, and UTC `reset_at` if reported. This is account usage, not an exact token balance. |
 | `wait` | `--turn-id TURN_ID` | Reads completion without submitting. Codex returns `thread_id`, `turn_id`, and `answer`. Hermes returns `thread_id`, `turn_id`, `status: completed`, and `session_output`. |
 | `recover` | None | Codex only. Resume the exact saved thread after the Codex process exits. Returns `thread_id`, `status: resumed` when idle. Sends no prompt. |
 
 `steer` and `wait` accept `--seconds` (1–600; default 120). On `turn_pending`, keep the identified turn ID and wait rather than resending. Hermes `thread_id` is its ACP session ID; its `turn_id` is a manager-issued correlation ID for this receiver. If the Hermes connection is lost, inspect the session in Hermes; the manager does not automatically recover or replay it. For Codex, `recover` verifies that the process exited before resuming the existing thread. Neither backend transfers a session between panes or automatically retries a failed or paused turn.
+
+The receiver rejects a mismatched bound thread or prior turn without sending the prompt. A receiver started from an older version does not support bound follow-ups. It rejects the request; never retry it without the binding flags. `--thread-id` cannot be combined with the active `--turn-id` option.
 
 Hermes ACP v1 correlates the prompt completion, not individual output chunks. Treat `session_output` as observed session text, not an exact answer to one admission. Do not submit to the managed session from another Hermes client while a turn is running. Concurrent input or session notices can mix with the stream; consult Hermes for authoritative history.
 
