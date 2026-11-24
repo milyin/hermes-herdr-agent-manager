@@ -156,14 +156,18 @@ class Contract(unittest.TestCase):
         scope = ['--instance','fixture','--workspace','w','--pane','p']
         with (tempfile.TemporaryDirectory() as home, patch.dict(os.environ,{'HERMES_HOME':home}),
               patch.object(mod,'pane_script'), patch.object(mod,'guard'),
-              patch('sys.stdout',new_callable=io.StringIO)):
+              patch('sys.stdout',new_callable=io.StringIO) as output):
             path = mod.binding_file('fixture','w','p')
-            path.touch(mode=0o600)
-            path.write_text(json.dumps(dict(token='key',agent='hermes',scope=['fixture','w','p'])),encoding='utf-8')
+            if os.name == 'nt':
+                stream = mod.windows_io().create_state_file(path)
+            else:
+                stream = os.fdopen(os.open(path,os.O_CREAT | os.O_EXCL | os.O_WRONLY,0o600),'w',encoding='utf-8')
+            with stream:
+                json.dump(dict(token='key',agent='hermes',scope=['fixture','w','p']),stream)
             for args, expected in (([], 'steer'), (['--thread-id','owned'], 'steer-bound')):
                 with (patch.object(mod.sys,'argv',['agent_manager.py','steer',*scope,'--prompt','hello',*args]),
                       patch.object(mod,'request',return_value={}) as send):
-                    self.assertEqual(mod.main(),0)
+                    self.assertEqual(mod.main(),0,output.getvalue())
                     self.assertEqual(send.call_args.args,('key',expected))
             with (patch.object(mod.sys,'argv',['agent_manager.py','steer',*scope,'--prompt','hello','--override-quota']),
                   patch.object(mod,'request') as send):
