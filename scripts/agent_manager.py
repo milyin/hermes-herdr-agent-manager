@@ -227,7 +227,7 @@ def quota(response, *, exact=False):
     by_id = response.get('rateLimitsByLimitId')
     codex = by_id.get('codex') if isinstance(by_id, dict) else None
     rates = codex if isinstance(codex, dict) and codex else response.get('rateLimits')
-    if not isinstance(rates, dict):
+    if not isinstance(rates, dict) or rates.get('limitId') not in (None,'codex'):
         raise Error('quota_unavailable', 'Codex did not report rate limits for this account')
     def window(key):
         val = rates.get(key)
@@ -237,7 +237,7 @@ def quota(response, *, exact=False):
             used = val['usedPercent']
             mins = val.get('windowDurationMins')
             reset = val.get('resetsAt')
-            if type(used) not in (int,float) or not 0 <= used <= 100:
+            if type(used) not in (int,float) or not 0 <= used < float('inf'):
                 raise ValueError
             if mins is not None and (type(mins) is not int or not 0 < mins < 2**63):
                 raise ValueError
@@ -246,7 +246,7 @@ def quota(response, *, exact=False):
             utc = None if reset is None else datetime.fromtimestamp(reset, timezone.utc).isoformat().replace('+00:00','Z')
         except (KeyError, TypeError, ValueError, OverflowError, OSError, AttributeError):
             return None
-        remaining = 100-Fraction(str(used))
+        remaining = Fraction(0) if used >= 100 else 100-Fraction(str(used))
         return {'remaining_percent':remaining if exact else json_percent(remaining), 'window_minutes':mins, 'reset_at':utc}
     return {'source':'codex_account_rate_limits', 'primary':window('primary'), 'secondary':window('secondary')}
 
@@ -376,10 +376,19 @@ class ChildRpc:
                                 quota_deadline = time.monotonic()+check.seconds_left()
                             write_deadline = deadline if quota_deadline is None else min(deadline,quota_deadline)
                             if win_pipe is not None:
+                                # Only queue the first byte under the quota cutoff. If
+                                # cancellation races completion, poison the stream and
+                                # never send the rest of this frame or replay it.
+                                first = not started and isinstance(check,QuotaWriteGuard) and quota_deadline is not None
+                                if first and time.monotonic() >= write_deadline:
+                                    if write_deadline == deadline:
+                                        raise Error('deadline_elapsed','Transport deadline passed before the Windows pipe write')
+                                    raise Error('quota_unavailable','Codex quota cutoff passed before the Windows pipe write')
                                 started = True  # An overlapped write can have partially reached the child.
-                                # Admission was checked before starting the write. Do not
-                                # cancel an in-flight frame just because quota later expires.
-                                size = win_pipe.write(data, deadline)
+                                size = win_pipe.write(data[:1] if first else data,write_deadline)
+                                if first and isinstance(check,QuotaWriteGuard) and (
+                                        time.monotonic() >= write_deadline or time.time() >= check.expires):
+                                    raise TimeoutError('First Windows prompt byte was not confirmed in time')
                             else:
                                 assert self.proc.stdin is not None
                                 size = os.write(self.proc.stdin.fileno(), data)

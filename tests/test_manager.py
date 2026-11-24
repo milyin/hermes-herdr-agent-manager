@@ -53,6 +53,31 @@ class Contract(unittest.TestCase):
             backend.rpc.return_value = {'rateLimits':{'primary':{'usedPercent':1e-15,'windowDurationMins':300,'resetsAt':now+18000}}}
             self.assertEqual(receiver.dispatch({'op':'check-quota'})['hold'],'quota_behind_pace')
 
+    def test_overdrawn_window_is_exhausted_not_missing(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        now = 1730947200
+        with patch.object(receiver,'codex') as backend, patch.object(mod.time,'time',return_value=now):
+            backend.rpc.return_value = {'rateLimits':{
+                'primary':{'usedPercent':101,'windowDurationMins':300,'resetsAt':now+60},
+                'secondary':{'usedPercent':5,'windowDurationMins':300,'resetsAt':now+60}}}
+            plan = receiver.dispatch({'op':'check-quota'})
+            self.assertEqual(plan['hold'],'quota_behind_pace')
+            self.assertEqual(plan['behind_windows'],['primary'])
+            self.assertEqual(plan['primary']['remaining_percent'],0)
+
+    def test_tagged_foreign_quota_does_not_count_as_codex_quota(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        now = 1730947200
+        with patch.object(receiver,'codex') as backend, patch.object(mod.time,'time',return_value=now):
+            window = {'usedPercent':5,'windowDurationMins':300,'resetsAt':now+60}
+            backend.rpc.return_value = {'rateLimitsByLimitId':{'codex':'invalid'},
+                                        'rateLimits':{'limitId':'other','primary':window}}
+            self.assertEqual(receiver.dispatch({'op':'check-quota'})['hold'],'quota_unavailable')
+            backend.rpc.return_value['rateLimits'].pop('limitId')
+            self.assertIsNone(receiver.dispatch({'op':'check-quota'})['hold'])
+
     def test_quota_ignores_an_out_of_range_duration(self):
         mod = api()
         receiver = mod.Receiver('/workspace')
@@ -496,6 +521,101 @@ class Contract(unittest.TestCase):
         with self.assertRaises(mod.Error) as caught:
             mod.read_frame(io.BytesIO(wire))
         self.assertEqual(caught.exception.code,'invalid_response')
+
+    def test_windows_write_bounds_first_transfer_and_completes_started_frame(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        codex = mod.Codex.__new__(mod.Codex)
+        codex.write_lock, codex.write_poisoned = threading.Lock(), False
+        codex.windows_stdin = Mock()
+        now = 1730947200
+        plan = dict(hold=None,usable_windows=['primary'],primary={'reset_at':'2024-11-07T02:40:01Z'})
+        message = {'method':'turn/start'}
+        data = mod.frame({**codex.version,**message})
+        with (patch.object(mod.time,'time',return_value=now) as wall,
+              patch.object(mod.time,'monotonic',return_value=100) as monotonic,
+              patch.object(receiver,'quota_plan',return_value=plan)):
+            def write(fragment, deadline):
+                if fragment[0:1] == data[0:1]:
+                    self.assertEqual(bytes(fragment),data[:1])
+                    self.assertEqual(deadline,101)
+                else:
+                    self.assertEqual(bytes(fragment),data[1:])
+                    self.assertEqual(deadline,115)
+                    wall.return_value = now+2
+                    monotonic.return_value = 102
+                return len(fragment)
+            codex.windows_stdin.write.side_effect = write
+            codex.write(message,receiver.enforce_quota({},lambda _deadline:None))
+            self.assertEqual(codex.windows_stdin.write.call_count,2)
+            self.assertFalse(codex.write_poisoned)
+
+    def test_windows_first_transfer_timeout_is_not_safe_to_replay(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        codex = mod.Codex.__new__(mod.Codex)
+        codex.write_lock, codex.write_poisoned = threading.Lock(), False
+        codex.windows_stdin = Mock()
+        codex.windows_stdin.write.side_effect = TimeoutError('overlapped progress unverified')
+        plan = dict(hold=None,usable_windows=['primary'],primary={'reset_at':'2024-11-07T02:40:01Z'})
+        with (patch.object(mod.time,'time',return_value=1730947200),
+              patch.object(mod.time,'monotonic',return_value=100), patch.object(receiver,'quota_plan',return_value=plan)):
+            for _ in range(2):
+                with self.assertRaises(mod.Error) as caught:
+                    codex.write({'method':'turn/start'},receiver.enforce_quota({},lambda _deadline:None))
+                self.assertEqual(caught.exception.code,'outcome_unknown')
+            codex.windows_stdin.write.assert_called_once()
+            self.assertEqual(codex.windows_stdin.write.call_args.args[1],101)
+            self.assertTrue(codex.write_poisoned)
+
+    def test_windows_first_byte_completion_observed_late_never_finishes_frame(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        codex = mod.Codex.__new__(mod.Codex)
+        codex.write_lock, codex.write_poisoned = threading.Lock(), False
+        codex.windows_stdin = Mock()
+        plan = dict(hold=None,usable_windows=['primary'],primary={'reset_at':'2024-11-07T02:40:01Z'})
+        for elapsed_clock in ('monotonic','wall'):
+            with self.subTest(clock=elapsed_clock):
+                codex.write_poisoned = False
+                codex.windows_stdin.reset_mock()
+                with (patch.object(mod.time,'time',return_value=1730947200) as wall,
+                      patch.object(mod.time,'monotonic',return_value=100) as monotonic,
+                      patch.object(receiver,'quota_plan',return_value=plan)):
+                    def observed_late(fragment, _deadline):
+                        self.assertEqual(len(fragment),1)
+                        if elapsed_clock == 'monotonic':
+                            monotonic.return_value = 101
+                        else:
+                            wall.return_value = 1730947201
+                        return 1
+                    codex.windows_stdin.write.side_effect = observed_late
+                    with self.assertRaises(mod.Error) as caught:
+                        codex.write({'method':'turn/start'},receiver.enforce_quota({},lambda _deadline:None))
+                    self.assertEqual(caught.exception.code,'outcome_unknown')
+                    codex.windows_stdin.write.assert_called_once()
+                    self.assertTrue(codex.write_poisoned)
+
+    def test_windows_before_write_reports_the_earliest_expired_deadline(self):
+        mod = api()
+        codex = mod.Codex.__new__(mod.Codex)
+        codex.write_lock, codex.write_poisoned = threading.Lock(), False
+        codex.windows_stdin = Mock()
+        now = 1730947200
+        for span, code in ((30,'deadline_elapsed'),(1,'quota_unavailable')):
+            with (self.subTest(span=span), patch.object(mod.time,'time',return_value=now),
+                  patch.object(mod.time,'monotonic',return_value=100) as monotonic):
+                guard = mod.QuotaWriteGuard(lambda _deadline:None,now+span)
+                def read_after_fence():
+                    monotonic.return_value = 100+min(15,span)
+                    return span
+                read_remaining = iter((lambda:span,read_after_fence))
+                with patch.object(guard,'seconds_left',side_effect=lambda:next(read_remaining)()):
+                    with self.assertRaises(mod.Error) as caught:
+                        codex.write({'method':'turn/start'},guard)
+                self.assertEqual(caught.exception.code,code)
+                codex.windows_stdin.write.assert_not_called()
+                self.assertFalse(codex.write_poisoned)
 
 
 @unittest.skipUnless(os.name == 'nt', 'Windows transport')
