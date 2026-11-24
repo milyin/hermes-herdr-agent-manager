@@ -3,6 +3,7 @@
 import argparse
 from contextlib import contextmanager, ExitStack, nullcontext, suppress
 from datetime import datetime, timezone
+from fractions import Fraction
 from functools import lru_cache
 import hashlib
 import importlib.util
@@ -218,8 +219,14 @@ def cwd_path(value):
     return str(path.resolve(strict=True))
 
 
-def quota(response):
-    rates = (response.get('rateLimitsByLimitId') or {}).get('codex') or response.get('rateLimits')
+def json_percent(value):
+    return value.numerator if value.denominator == 1 else float(value)
+
+
+def quota(response, *, exact=False):
+    by_id = response.get('rateLimitsByLimitId')
+    codex = by_id.get('codex') if isinstance(by_id, dict) else None
+    rates = codex if isinstance(codex, dict) and codex else response.get('rateLimits')
     if not isinstance(rates, dict):
         raise Error('quota_unavailable', 'Codex did not report rate limits for this account')
     def window(key):
@@ -232,15 +239,36 @@ def quota(response):
             reset = val.get('resetsAt')
             if type(used) not in (int,float) or not 0 <= used <= 100:
                 raise ValueError
-            if mins is not None and (type(mins) is not int or mins <= 0):
+            if mins is not None and (type(mins) is not int or not 0 < mins < 2**63):
                 raise ValueError
             if reset is not None and type(reset) is not int:
                 raise ValueError
             utc = None if reset is None else datetime.fromtimestamp(reset, timezone.utc).isoformat().replace('+00:00','Z')
-        except (KeyError, TypeError, ValueError, OverflowError, OSError, AttributeError) as exc:
-            raise Error('quota_unavailable', 'Codex returned an invalid rate window') from exc
-        return {'remaining_percent':100-used, 'window_minutes':mins, 'reset_at':utc}
+        except (KeyError, TypeError, ValueError, OverflowError, OSError, AttributeError):
+            return None
+        remaining = 100-Fraction(str(used))
+        return {'remaining_percent':remaining if exact else json_percent(remaining), 'window_minutes':mins, 'reset_at':utc}
     return {'source':'codex_account_rate_limits', 'primary':window('primary'), 'secondary':window('secondary')}
+
+
+def reset_seconds(window):
+    return int(datetime.fromisoformat(window['reset_at'].replace('Z','+00:00')).timestamp())
+
+
+class QuotaWriteGuard:
+    def __init__(self, check, expires):
+        self.check, self.expires = check, expires
+
+    def __call__(self, deadline=None):
+        until = self.check(deadline)
+        self.seconds_left()
+        return until
+
+    def seconds_left(self):
+        left = self.expires-time.time()
+        if left <= 0:
+            raise Error('quota_unavailable','Codex quota snapshot expired before the prompt write')
+        return left
 
 
 def agent_binary(name):
@@ -318,15 +346,19 @@ class ChildRpc:
         if not self.write_lock.acquire(timeout=max(0,deadline-time.monotonic())):
             raise Error('deadline_elapsed',f'Timed out before writing to {self.label}')
         started = False
+        quota_deadline = None
         try:
             if self.write_poisoned:
                 raise Error('outcome_unknown','A prior frame was partially written; do not send more input')
             try:
                 win_pipe = getattr(self, 'windows_stdin', None)
                 while data:
-                    remaining = deadline-time.monotonic()
+                    write_deadline = deadline if quota_deadline is None else min(deadline,quota_deadline)
+                    remaining = write_deadline-time.monotonic()
                     if remaining <= 0:
                         code = 'outcome_unknown' if started else 'deadline_elapsed'
+                        if not started and quota_deadline is not None and quota_deadline <= deadline:
+                            code = 'quota_unavailable'
                         raise Error(code,f'Timed out writing to {self.label}; inspect the prior turn before retrying')
                     try:
                         if not started and check is not None:
@@ -340,17 +372,23 @@ class ChildRpc:
                             # on Windows where an expired overlapped write could still complete.
                             if not started and time.monotonic() >= deadline:
                                 raise Error('deadline_elapsed', 'The write deadline expired before the agent received input')
+                            if not started and isinstance(check,QuotaWriteGuard):
+                                quota_deadline = time.monotonic()+check.seconds_left()
+                            write_deadline = deadline if quota_deadline is None else min(deadline,quota_deadline)
                             if win_pipe is not None:
                                 started = True  # An overlapped write can have partially reached the child.
+                                # Admission was checked before starting the write. Do not
+                                # cancel an in-flight frame just because quota later expires.
                                 size = win_pipe.write(data, deadline)
                             else:
                                 assert self.proc.stdin is not None
                                 size = os.write(self.proc.stdin.fileno(), data)
                     except BlockingIOError:
                         assert self.proc.stdin is not None
-                        select.select([],[self.proc.stdin.fileno()],[],max(0,deadline-time.monotonic()))
+                        select.select([],[self.proc.stdin.fileno()],[],max(0,write_deadline-time.monotonic()))
                     else:
                         started = True
+                        quota_deadline = None
                         if size <= 0:
                             raise Error('outcome_unknown', f'{self.label} stdin made no progress; do not replay')
                         data = data[size:]
@@ -364,6 +402,7 @@ class ChildRpc:
             raise
         finally:
             self.write_lock.release()
+        return deadline
 
     @contextmanager
     def write_fence(self, msg):
@@ -417,7 +456,11 @@ class ChildRpc:
             ident = self.sequence
             self.replies[ident] = None
         try:
-            self.write({'id':ident,'method':method,'params':params},check,deadline)
+            written_by = self.write({'id':ident,'method':method,'params':params},check,deadline)
+            if method == 'account/rateLimits/read':
+                # An unanswered quota read cannot submit work. Bound its reply
+                # wait so it can return that definitive result to the caller.
+                deadline = written_by
             with self.condition:
                 self.condition.wait_for(lambda: self.replies[ident] is not None or self.dead, timeout=max(0,deadline-time.monotonic()))
                 data = self.replies[ident]
@@ -666,9 +709,18 @@ class Receiver:
         self.model = None
         self.network = False
         self.uncertain = False
+        self.quota_backend_failed = False
         self.mutation = threading.Lock()
 
     def backend(self, check):
+        if not self.uncertain and self.thread is None and self.codex is not None and (
+                self.quota_backend_failed or self.codex.dead is True or self.codex.write_poisoned is True):
+            # No prompt or thread is attached to this broken client. Replace it
+            # on a subsequent request, not while returning the rejection.
+            check()
+            self.codex.stop_unassigned()
+            self.codex = None
+            self.quota_backend_failed = False
         if self.codex is None:
             for attempt in range(2):
                 try:
@@ -677,9 +729,63 @@ class Receiver:
                     self.codex = Codex(self.cwd,check)
                     break
                 except Error as exc:
-                    if attempt or exc.code not in ('codex_disconnected','outcome_unknown'):
+                    if exc.code not in ('codex_disconnected','outcome_unknown'):
                         raise
+                    if attempt:
+                        raise Error('codex_not_ready','Codex initialization failed before any prompt was sent') from exc
         return self.codex
+
+    def quota_plan(self, check):
+        try:
+            snapshot = self.read_quota(check,exact=True)
+        except Error as exc:
+            # This was a read, so lack of a response cannot mean a prompt was sent.
+            if exc.code not in ('quota_unavailable', 'outcome_unknown', 'invalid_response', 'codex_rejected', 'codex_disconnected','codex_not_ready'):
+                raise
+            snapshot = {'primary':None, 'secondary':None}
+        windows, behind = [], []
+        now = Fraction(str(time.time()))
+        for name in ('primary','secondary'):
+            window = snapshot[name]
+            if window is None:
+                continue
+            remaining = window['remaining_percent']
+            window['remaining_percent'] = json_percent(remaining)
+            if window['window_minutes'] is None or window['reset_at'] is None:
+                continue
+            left = reset_seconds(window) - now
+            if left <= 0:
+                continue
+            windows.append(name)
+            duration = window['window_minutes'] * 60
+            if remaining * duration < 100 * min(left, duration):
+                behind.append(name)
+        code = 'quota_unavailable' if not windows else 'quota_behind_pace' if behind else None
+        return dict(snapshot, usable_windows=windows, behind_windows=behind, hold=code)
+
+    def enforce_quota(self, packet, check):
+        if packet.get('override_quota') is True:
+            return check
+        plan = self.quota_plan(check)
+        if plan['hold'] == 'quota_unavailable':
+            raise Error('quota_unavailable', 'No usable Codex quota window; no prompt was sent')
+        if plan['hold'] == 'quota_behind_pace':
+            raise Error('quota_behind_pace', 'Codex quota below the remaining time share; no prompt was sent')
+        windows = plan['usable_windows']
+        assert isinstance(windows,list) and windows
+        expires = min(reset_seconds(plan[name]) for name in windows)
+
+        return QuotaWriteGuard(check,expires)
+
+    def read_quota(self, check, *, exact=False):
+        backend = self.backend(check)
+        assert backend is not None
+        try:
+            return quota(backend.rpc('account/rateLimits/read', {},check),exact=exact)
+        except Error as exc:
+            if self.thread is None and exc.code == 'codex_disconnected':
+                self.quota_backend_failed = True
+            raise
 
     def start(self, inputs, check):
         assert self.codex is not None
@@ -705,8 +811,15 @@ class Receiver:
         if op == 'hello':
             receipt = {'receiver':True, 'cwd':self.cwd}
             return receipt if self.agent == 'codex' else dict(receipt, agent=self.agent)
-        if op in ('run', 'quota') and packet.get('agent', 'codex') != self.agent:
+        # Use distinct wire operations for clients requiring quota enforcement.
+        # An older receiver rejects them instead of ignoring a new field.
+        if op in ('run-admitted','steer-admitted','steer-bound-admitted'):
+            op = op.removesuffix('-admitted')
+        if op in ('run', 'quota', 'check-quota') and packet.get('agent', 'codex') != self.agent:
             raise Error('agent_mismatch', f'This pane is provisioned for {self.agent}; use a pane for the requested agent')
+        if packet.get('override_quota') is True and (self.agent != 'codex' or op not in ('run','steer','steer-bound')
+                                                      or packet.get('expected_turn') is not None):
+            raise Error('invalid_quota_override', 'Quota override is only for a new Codex turn')
         if op == 'wait':
             with self.mutation:
                 backend, thread, turn = self.active_backend(), self.thread, self.turn
@@ -744,10 +857,10 @@ class Receiver:
         return self.codex
 
     def apply(self, op, packet, check):
+        if op == 'check-quota':
+            return self.quota_plan(check)
         if op == 'quota':
-            backend = self.backend(check)
-            assert backend is not None
-            return quota(backend.rpc('account/rateLimits/read', {},check))
+            return self.read_quota(check)
         if op == 'recover':
             if self.thread is None or self.codex is None:
                 raise Error('not_running', 'No recorded Codex thread is available for recovery')
@@ -784,13 +897,21 @@ class Receiver:
             self.network = packet.get('network') is True
             self.backend(check)
             assert self.codex is not None
+            check_turn = self.enforce_quota(packet,check)
             result = self.codex.rpc('thread/start', self.thread_options(),check)
             thread = result.get('thread')
             self.thread = thread.get('id') if isinstance(thread,dict) else None
             if not isinstance(self.thread,str) or not self.thread:
                 raise Error('outcome_unknown', 'Codex did not identify the new thread')
             print('Codex thread ready', flush=True)
-            return self.start(inputs,check)
+            try:
+                return self.start(inputs,check_turn)
+            except Error as exc:
+                if exc.code in ('quota_unavailable','deadline_elapsed'):
+                    # These codes precede the first prompt byte. An empty
+                    # native thread is not a confirmed first turn.
+                    self.thread = None
+                raise
         if self.codex is None or self.thread is None:
             raise Error('not_running', 'Run Codex in this pane first')
         if self.codex.dead:
@@ -808,7 +929,7 @@ class Receiver:
             if expected is None:
                 if running:
                     raise Error('turn_active', 'Provide --turn-id to steer the exact active turn')
-                return self.start(inputs,check)
+                return self.start(inputs,self.enforce_quota(packet,check))
             if not running or self.turn != expected:
                 raise Error('turn_changed', 'Expected turn is not active; no follow-up was sent')
             r = self.codex.rpc('turn/steer', {'threadId':self.thread,'expectedTurnId':self.turn,'input':inputs},check)
@@ -829,7 +950,7 @@ class HermesReceiver(Receiver):
         return self.acp
 
     def apply(self, op, packet, check):
-        if op in ('quota', 'recover'):
+        if op in ('quota', 'check-quota', 'recover'):
             raise Error('unsupported_operation', f'{op} is not implemented for Hermes ACP; use the Hermes CLI or UI')
         if self.acp is not None:
             self.acp.require_available(idle=True)
@@ -912,7 +1033,7 @@ def serve(token, cwd, scope, agent='codex'):
                     return until
                 if packet.get('op') != 'hello':
                     check()
-                if packet.get('op') in ('wait','steer','steer-bound') and (type(packet.get('seconds')) is not int or not 1 <= packet['seconds'] <= 600):
+                if packet.get('op') in ('wait','steer','steer-bound','steer-admitted','steer-bound-admitted') and (type(packet.get('seconds')) is not int or not 1 <= packet['seconds'] <= 600):
                     raise Error('invalid_wait', 'Wait must be 1 through 600 seconds')
                 result = {'ok':True,'result':receiver.dispatch(packet,check)}
             except Error as e:
@@ -1009,7 +1130,7 @@ def provision(scope: tuple[str, str], cwd, group, suffix, agent='codex'):
     return {'pane_id':pane,'cwd':cwd,'agent':agent,'status':'ready'}
 
 
-def bound(scope: tuple[str, str], pane, timeout: float=40, *, agent=None):
+def verified_binding(scope: tuple[str, str], pane, timeout: float=40, *, agent=None):
     target = binding_file(*scope,pane)
     try:
         if os.name == 'nt':
@@ -1027,16 +1148,23 @@ def bound(scope: tuple[str, str], pane, timeout: float=40, *, agent=None):
     if not isinstance(value,dict) or value.get('scope') != [*scope,pane] or not isinstance(value.get('token'),str):
         raise Error('bad_binding','Cannot verify this pane binding')
     # Before agent selection existed all receipts referred exclusively to Codex.
-    if agent is not None and value.get('agent', 'codex') != agent:
+    owner = value.get('agent','codex')
+    if owner not in AGENTS:
+        raise Error('bad_binding','Cannot verify this pane agent')
+    if agent is not None and owner != agent:
         raise Error('agent_mismatch', f'This pane was not provisioned for {agent}')
     guard(*scope,pane,timeout=timeout)
-    return value['token']
+    return value['token'], owner
+
+
+def bound(scope: tuple[str, str], pane, timeout: float=40, *, agent=None):
+    return verified_binding(scope,pane,timeout,agent=agent)[0]
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='op',required=True)
-    for op in ('provision','run','steer','change-model','get-remaining-tokens','wait','recover'):
+    for op in ('provision','run','steer','change-model','get-remaining-tokens','check-quota','wait','recover'):
         p = commands.add_parser(op,allow_abbrev=False)
         p.add_argument('--instance',required=True)
         p.add_argument('--workspace',required=True)
@@ -1046,6 +1174,8 @@ def main():
             p.add_argument('--cwd',required=True)
         if op in ('provision','run','get-remaining-tokens'):
             p.add_argument('--agent',choices=AGENTS,required=op != 'provision',default='codex')
+        if op == 'check-quota':
+            p.add_argument('--agent',choices=('codex',),default='codex')
         if op == 'provision':
             p.add_argument('--group',default='agents')
             p.add_argument('--suffix')
@@ -1054,6 +1184,7 @@ def main():
         if op == 'run':
             p.add_argument('--network',action='store_true',help='Only for explicitly authorized Codex sandbox networking')
         if op in ('run','steer'):
+            p.add_argument('--override-quota',action='store_true',help='Skip local pacing for this new Codex turn only')
             prompt = p.add_mutually_exclusive_group(required=True)
             prompt.add_argument('--prompt')
             prompt.add_argument('--prompt-stdin',action='store_true')
@@ -1074,6 +1205,9 @@ def main():
     a=parser.parse_args()
     if a.op == 'run' and a.agent == 'codex' and a.model is None:
         parser.error('run --agent codex requires --model')
+    if (a.op == 'run' and a.agent != 'codex' and a.override_quota or
+            a.op == 'steer' and a.turn_id is not None and a.override_quota):
+        parser.error('--override-quota is only for a new Codex turn')
     if a.op == 'steer' and ((a.after_turn_id is not None and a.thread_id is None) or
                             (a.thread_id is not None and a.turn_id is not None)):
         parser.error('--after-turn-id requires --thread-id; --turn-id cannot be used with --thread-id')
@@ -1091,13 +1225,17 @@ def main():
             suffix = a.suffix if a.suffix is not None else {'codex':'Codex','hermes':'Hermes'}[a.agent]
             result=provision(scope,a.cwd,a.group,suffix,a.agent)
         else:
-            token=bound(scope,a.pane,agent=getattr(a,'agent',None))
+            token, owner=verified_binding(scope,a.pane,agent=getattr(a,'agent',None))
             fields={'pane':a.pane}
             if a.op in ('run','get-remaining-tokens'):
                 fields['agent']=a.agent
             if a.op in ('run','steer'):
                 fields['prompt']=sys.stdin.buffer.read(MAX_PROMPT+1).decode() if a.prompt_stdin else a.prompt
                 text_input(fields['prompt'])
+                if owner=='codex':
+                    fields['override_quota']=a.override_quota
+                elif a.override_quota:
+                    raise Error('invalid_quota_override','Quota override is only for a new Codex turn')
             if a.op == 'change-model':
                 fields['model']=validate_model(a.model, hermes=True)
             if a.op == 'run' and (a.agent == 'codex' or a.model is not None):
@@ -1113,7 +1251,9 @@ def main():
             op='quota' if a.op=='get-remaining-tokens' else a.op
             if a.op=='steer' and a.thread_id is not None:
                 fields.update(expected_thread=a.thread_id,after_turn=a.after_turn_id)
-                op='steer-bound'  # An older receiver must reject it, not ignore a new field.
+                op='steer-bound'
+            if owner=='codex' and (a.op=='run' or (a.op=='steer' and a.turn_id is None)):
+                op+='-admitted'
             result=request(token,op,**fields)
         print(json.dumps(dict(ok=True,result=result)))
         return 0

@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -9,7 +10,7 @@ import threading
 import time
 import unittest
 import uuid
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -40,10 +41,134 @@ class Contract(unittest.TestCase):
         self.assertEqual(result['secondary']['remaining_percent'],20)
         self.assertIsNone(api().quota({'rateLimits':{}})['primary'])
 
+    def test_fractional_quota_allows_exact_pacing_equality(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        now = 1730947200
+        with patch.object(receiver,'codex') as backend, patch.object(mod.time,'time',return_value=now):
+            backend.rpc.return_value = {'rateLimits':{'primary':{'usedPercent':90.4,'windowDurationMins':300,'resetsAt':now+1728}}}
+            plan = receiver.dispatch({'op':'check-quota'})
+            self.assertIsNone(plan['hold'])
+            self.assertEqual(plan['primary']['remaining_percent'],9.6)
+            backend.rpc.return_value = {'rateLimits':{'primary':{'usedPercent':1e-15,'windowDurationMins':300,'resetsAt':now+18000}}}
+            self.assertEqual(receiver.dispatch({'op':'check-quota'})['hold'],'quota_behind_pace')
+
+    def test_quota_ignores_an_out_of_range_duration(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        now = 1730947200
+        with patch.object(receiver,'codex') as backend, patch.object(mod.time,'time',return_value=now):
+            backend.rpc.return_value = {'rateLimits':{
+                'primary':{'usedPercent':12.5,'windowDurationMins':10**320,'resetsAt':now+60},
+                'secondary':{'usedPercent':50,'windowDurationMins':300,'resetsAt':now+60}}}
+            plan = receiver.dispatch({'op':'check-quota'})
+            self.assertEqual(plan['usable_windows'],['secondary'])
+            self.assertIsNone(plan['hold'])
+
+    def test_run_rejects_behind_pace_before_creating_a_thread(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        packet = dict(op='run', cwd='/workspace', model='model', prompt='literal prompt')
+        now = 1730947200
+        weekly = dict(usedPercent=90, windowDurationMins=10080, resetsAt=now+2*86400)
+        with patch.object(receiver, 'codex') as backend, patch.object(mod, 'time') as clock:
+            clock.time.return_value = now
+            backend.rpc.return_value = {'rateLimits':{'primary':weekly, 'secondary':None}}
+            with self.assertRaises(mod.Error) as caught:
+                receiver.dispatch(packet)
+            self.assertEqual(caught.exception.code, 'quota_behind_pace')
+            self.assertEqual([c.args[0] for c in backend.rpc.call_args_list], ['account/rateLimits/read'])
+            self.assertIsNone(receiver.thread)
+            self.assertFalse(receiver.uncertain)
+
+    def test_quota_plan_uses_all_and_only_usable_windows(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        now = 1730947200
+        primary = dict(usedPercent=50, windowDurationMins=10080, resetsAt=now+2*86400)
+        secondary = dict(usedPercent=60, windowDurationMins=300, resetsAt=now+2*3600)
+        with patch.object(receiver, 'codex') as backend, patch.object(mod.time, 'time', return_value=now):
+            rates: dict[str,dict[str,object]] = {'primary':dict(primary),'secondary':dict(secondary)}
+            backend.rpc.return_value = {'rateLimits':rates}
+            packet = {'op':'check-quota'}
+            plan = receiver.dispatch(packet)
+            self.assertEqual(plan['usable_windows'], ['primary','secondary'])
+            self.assertIsNone(plan['hold'])  # Equality in the five-hour window passes.
+            rates['secondary']['usedPercent'] = 61
+            self.assertEqual(receiver.dispatch(packet)['behind_windows'], ['secondary'])
+            rates['secondary'] = {'usedPercent':'malformed'}
+            plan = receiver.dispatch(packet)
+            self.assertEqual(plan['usable_windows'], ['primary'])
+            self.assertIsNone(plan['hold'])
+            rates['primary']['resetsAt'] = now-1
+            self.assertEqual(receiver.dispatch(packet)['hold'], 'quota_unavailable')
+            backend.rpc.side_effect = mod.Error('outcome_unknown','No quota response')
+            self.assertEqual(receiver.dispatch(packet)['hold'], 'quota_unavailable')
+            self.assertIsNone(receiver.thread)
+            self.assertFalse(receiver.uncertain)
+
+    def test_idle_quota_override_only_applies_to_one_new_turn(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        receiver.thread, receiver.turn, receiver.model = 'owned', 'previous', 'model'
+        packet = dict(op='steer-bound-admitted', expected_thread='owned', prompt='next', seconds=1)
+        with patch.object(receiver, 'codex') as backend:
+            backend.dead = False
+            backend.state.return_value = {'status':'completed'}
+            backend.rpc.return_value = {}
+            for extra in ({}, {'override_quota':'yes'}):
+                with self.assertRaises(mod.Error) as caught:
+                    receiver.dispatch(dict(packet, **extra))
+                self.assertEqual(caught.exception.code, 'quota_unavailable')
+            backend.rpc.reset_mock()
+            backend.rpc.return_value = {'turn':{'id':'new'}}
+            backend.wait.return_value = {'turn_id':'new'}
+            self.assertEqual(receiver.dispatch(dict(packet, override_quota=True))['turn_id'], 'new')
+            self.assertEqual([c.args[0] for c in backend.rpc.call_args_list], ['turn/start'])
+            backend.rpc.return_value = {}
+            with self.assertRaises(mod.Error) as caught:
+                receiver.dispatch(packet)
+            self.assertEqual(caught.exception.code, 'quota_unavailable')
+            self.assertEqual(receiver.turn,'new')
+
+    def test_cli_uses_quota_aware_operations_without_fallback(self):
+        mod = api()
+        scope = ['--instance','fixture','--workspace','w','--pane','p']
+        commands = [(['run','--cwd',str(ROOT),'--agent','codex','--model','model','--override-quota'], 'run-admitted', True),
+                    (['steer','--thread-id','thread','--after-turn-id','last'], 'steer-bound-admitted', False),
+                    (['steer'], 'steer-admitted', False), (['steer','--turn-id','active'], 'steer', False)]
+        with patch.object(mod, 'pane_script'), patch.object(mod, 'verified_binding', return_value=('key','codex')), patch('sys.stdout',new_callable=io.StringIO):
+            for args, wire_op, override in commands:
+                with (patch.object(mod.sys,'argv',['agent_manager.py',*args,*scope,'--prompt','hello']),
+                      patch.object(mod,'request',side_effect=mod.Error('invalid_operation','old receiver')) as request):
+                    self.assertEqual(mod.main(),1)
+                    request.assert_called_once()
+                    self.assertEqual(request.call_args.args,('key',wire_op))
+                    self.assertIs(request.call_args.kwargs['override_quota'],override)
+
     def test_private_binding_changes_with_scope(self):
         mod = api()
         self.assertNotEqual(mod.binding_key('first','w1','w1:p1'), mod.binding_key('second','w1','w1:p1'))
         self.assertNotEqual(mod.binding_key('first','w1','w1:p1'), mod.binding_key('first','w2','w1:p1'))
+
+    def test_hermes_idle_steer_uses_legacy_wire_operation(self):
+        mod = api()
+        scope = ['--instance','fixture','--workspace','w','--pane','p']
+        with (tempfile.TemporaryDirectory() as home, patch.dict(os.environ,{'HERMES_HOME':home}),
+              patch.object(mod,'pane_script'), patch.object(mod,'guard'),
+              patch('sys.stdout',new_callable=io.StringIO)):
+            path = mod.binding_file('fixture','w','p')
+            path.touch(mode=0o600)
+            path.write_text(json.dumps(dict(token='key',agent='hermes',scope=['fixture','w','p'])),encoding='utf-8')
+            for args, expected in (([], 'steer'), (['--thread-id','owned'], 'steer-bound')):
+                with (patch.object(mod.sys,'argv',['agent_manager.py','steer',*scope,'--prompt','hello',*args]),
+                      patch.object(mod,'request',return_value={}) as send):
+                    self.assertEqual(mod.main(),0)
+                    self.assertEqual(send.call_args.args,('key',expected))
+            with (patch.object(mod.sys,'argv',['agent_manager.py','steer',*scope,'--prompt','hello','--override-quota']),
+                  patch.object(mod,'request') as send):
+                self.assertEqual(mod.main(),1)
+                send.assert_not_called()
 
     def test_binding_cleanup_failure_preserves_partial_provision(self):
         mod = api()
@@ -182,6 +307,8 @@ class Contract(unittest.TestCase):
 
             def rpc(self, method, params, check):
                 check()
+                if method == 'account/rateLimits/read':
+                    return {'rateLimits':{'primary':{'usedPercent':0,'windowDurationMins':300,'resetsAt':int(time.time())+60}}}
                 if method != 'turn/start':
                     raise AssertionError(method)
                 return {'turn':None}
@@ -214,10 +341,78 @@ class Contract(unittest.TestCase):
         mod = api()
         codex = mod.Codex.__new__(mod.Codex)
         codex.condition, codex.replies, codex.sequence, codex.dead = threading.Condition(), {}, 0, False
-        codex.write = lambda message, *_: codex.replies.update({message['id']:{'id':message['id'],'error':None}})
+        def malformed_reply(message, _check, deadline):
+            codex.replies[message['id']] = {'id':message['id'],'error':None}
+            return deadline
+        codex.write = malformed_reply
         with self.assertRaises(mod.Error) as caught:
             codex.rpc('turn/start', {})
         self.assertEqual(caught.exception.code, 'invalid_response')
+
+    def test_quota_rpc_reply_wait_honors_request_deadline(self):
+        mod = api()
+        codex = mod.Codex.__new__(mod.Codex)
+        codex.condition, codex.replies, codex.sequence, codex.dead = threading.Condition(), {}, 0, False
+        codex.write_lock = threading.Lock()
+        codex.write_poisoned = False
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd,'rb'), os.fdopen(write_fd,'wb') as writer:
+            codex.proc = type('Process',(),{'stdin':writer})()
+            with (patch.object(mod.time,'monotonic',return_value=100),
+                  patch.object(codex.condition,'wait_for',return_value=False) as wait):
+                with self.assertRaises(mod.Error) as caught:
+                    codex.rpc('account/rateLimits/read',{},lambda _until:107)
+                self.assertEqual(caught.exception.code,'outcome_unknown')
+                self.assertEqual(wait.call_args.kwargs['timeout'],7)
+                with self.assertRaises(mod.Error):
+                    codex.rpc('turn/steer',{},lambda _until:107)
+                self.assertEqual(wait.call_args.kwargs['timeout'],15)
+
+    def test_disconnected_initial_quota_read_does_not_strand_receiver(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        packet = dict(op='run', cwd='/workspace', model='model', prompt='hello')
+        broken = Mock(dead=False,write_poisoned=False)
+        broken.rpc.side_effect = mod.Error('codex_disconnected','read channel closed')
+        receiver.codex = broken
+        with self.assertRaises(mod.Error) as caught:
+            receiver.dispatch(packet)
+        self.assertEqual(caught.exception.code,'quota_unavailable')
+        self.assertFalse(receiver.uncertain)
+        fresh = Mock(dead=False,write_poisoned=False)
+        fresh.rpc.side_effect = ({'thread':{'id':'owned'}},{'turn':{'id':'first'}})
+        timeout = mod.Error('outcome_unknown','initialization timed out')
+        with patch.object(mod,'Codex',side_effect=(timeout,timeout,fresh)):
+            with self.assertRaises(mod.Error) as caught:
+                receiver.dispatch(dict(packet,override_quota=True))
+            self.assertEqual(caught.exception.code,'codex_not_ready')
+            self.assertFalse(receiver.uncertain)
+            self.assertEqual(receiver.dispatch(dict(packet,override_quota=True))['turn_id'],'first')
+        broken.stop_unassigned.assert_called_once()
+
+    def test_quota_expiring_after_thread_creation_rejects_before_prompt_write(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        packet = dict(op='run',cwd='/workspace',model='model',prompt='hello')
+        now = 1730947200
+        writes = []
+        with patch.object(receiver,'codex') as backend, patch.object(mod.time,'time',return_value=now) as wall:
+            def rpc(method, _params, verify):
+                verify()
+                writes.append(method)
+                if method=='account/rateLimits/read':
+                    return {'rateLimits':{'primary':{'usedPercent':45,'windowDurationMins':300,'resetsAt':now+1}}}
+                if method=='thread/start':
+                    wall.return_value=now+1
+                    return {'thread':{'id':'unsubmitted'}}
+                return {'turn':{'id':'unexpected'}}
+            backend.rpc.side_effect = rpc
+            with self.assertRaises(mod.Error) as caught:
+                receiver.dispatch(packet)
+            self.assertEqual(caught.exception.code,'quota_unavailable')
+            self.assertEqual(writes,['account/rateLimits/read','thread/start'])
+            self.assertIsNone(receiver.thread)
+            self.assertFalse(receiver.uncertain)
 
     def test_unknown_receiver_result_never_returns_a_definitive_error(self):
         mod = api()
@@ -226,6 +421,70 @@ class Contract(unittest.TestCase):
             with self.assertRaises(mod.Error) as caught:
                 mod.receiver_result(invalid)
             self.assertEqual(caught.exception.code,'outcome_unknown')
+
+    def test_initial_turn_prewrite_deadline_does_not_bind_empty_thread(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        packet = dict(op='run',cwd='/workspace',model='model',prompt='hello',override_quota=True)
+        with patch.object(receiver,'codex') as backend:
+            backend.rpc.side_effect = ({'thread':{'id':'empty'}},mod.Error('deadline_elapsed','Before writing'))
+            with self.assertRaises(mod.Error) as caught:
+                receiver.dispatch(packet)
+            self.assertEqual(caught.exception.code,'deadline_elapsed')
+            self.assertIsNone(receiver.thread)
+            self.assertFalse(receiver.uncertain)
+
+    def test_quota_expiry_at_real_write_fence_puts_no_bytes_on_pipe(self):
+        from contextlib import contextmanager
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        codex = mod.Codex.__new__(mod.Codex)
+        codex.write_lock = threading.Lock()
+        codex.write_poisoned = False
+        now = 1730947200
+        plan = dict(hold=None,usable_windows=['primary'],primary={'reset_at':'2024-11-07T02:40:01Z'})
+        read_fd, write_fd = os.pipe()
+        with (os.fdopen(read_fd,'rb') as reader, os.fdopen(write_fd,'wb') as writer,
+              patch.object(mod.time,'time',return_value=now) as wall, patch.object(receiver,'quota_plan',return_value=plan)):
+            codex.proc = type('Process',(),{'stdin':writer})()
+            @contextmanager
+            def write_fence(_message):
+                wall.return_value = now+1
+                yield
+            codex.write_fence = write_fence
+            check = receiver.enforce_quota({},lambda _deadline:None)
+            with self.assertRaises(mod.Error) as caught:
+                codex.write({'method':'turn/start'},check)
+            self.assertEqual(caught.exception.code,'quota_unavailable')
+            writer.close()
+            self.assertEqual(reader.read(),b'')
+
+    def test_quota_expiry_finishes_an_already_started_prompt_frame(self):
+        mod = api()
+        receiver = mod.Receiver('/workspace')
+        codex = mod.Codex.__new__(mod.Codex)
+        codex.write_lock, codex.write_poisoned = threading.Lock(), False
+        now = 1730947200
+        plan = dict(hold=None,usable_windows=['primary'],primary={'reset_at':'2024-11-07T02:40:01Z'})
+        real_write = os.write
+        read_fd, write_fd = os.pipe()
+        with (os.fdopen(read_fd,'rb') as reader, os.fdopen(write_fd,'wb') as writer,
+              patch.object(mod.time,'time',return_value=now) as wall,
+              patch.object(mod.time,'monotonic',return_value=100) as monotonic,
+              patch.object(receiver,'quota_plan',return_value=plan)):
+            codex.proc = type('Process',(),{'stdin':writer})()
+            def short_write(fd, data):
+                if monotonic.return_value == 100:
+                    monotonic.return_value = 102
+                    wall.return_value = now+2
+                    return real_write(fd,data[:1])
+                return real_write(fd,data)
+            message = {'method':'turn/start'}
+            with patch.object(mod.os,'write',side_effect=short_write):
+                codex.write(message,receiver.enforce_quota({},lambda _deadline:None))
+            writer.close()
+            self.assertEqual(reader.read(),mod.frame({**codex.version,**message}))
+            self.assertFalse(codex.write_poisoned)
 
     def test_duplicate_json_fields_are_not_silently_overwritten(self):
         mod = api()
