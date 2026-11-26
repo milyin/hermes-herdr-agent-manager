@@ -35,4 +35,20 @@ The CLI emits UTF-8 JSON: `{"ok":true,"result":{...}}` on success (exit 0), or `
 
 Use `--prompt-stdin` to keep prompt text out of the process argument list. Prompts are limited to 32 KiB UTF-8 and local protocol frames to 1 MiB. If Codex reports no rate-limit snapshot, the quota call fails; an individual window or reset date is `null` when Codex does not report it.
 
+## Managed interactive Codex workers
+
+Linux interactive workers require Codex CLI 0.171 or compatible, Python websockets 15, and the pane manager's structured labels. The agent manager gives the Codex TUI and receiver one private app-server connection per pane. The TUI creates the thread and handles native requests for approvals and input. You can interact with that thread through the pane. Thread switching, forks, rewinds and separate native reviews are outside this managed session.
+
+| Operation | Arguments and result |
+| --- | --- |
+| `preflight` | `--agent codex --model MODEL --cwd DIR [--launch-profile PROFILE]`. Verify launch inputs and the local backend without opening a pane or sending a model prompt. |
+| `provision` | Add `--worker NAME --agent codex --model MODEL --status STATUS [--launch-profile PROFILE]` with the normal workspace and directory arguments. Wait for the TUI to attach. Return the exact pane and native thread IDs. |
+| `account-quota` | `[--launch-profile PROFILE]`. Query the account without a pane or turn. Return a nonsecret account identifier, windows, observation time and provider permission where reported. |
+| `status` | `--pane PANE_ID` and the exact workspace and instance. Return the live worker and thread binding, state, tracked turn, and any current attention ID and reason. |
+| `run` or `steer` | Use `--request-stdin` with one UTF-8 JSON line containing `prompt`, the account identifier from `account-quota`, and optional `parameters` on run. For an idle follow-up also supply `--thread-id` and `--return-admission`. Return the native turn admission immediately. The caller can read completion separately. |
+| `result` | `--pane PANE_ID --turn-id TURN_ID`. Read the exact native turn's result and attached parameters. `status` and `result` can inspect zoomed panes. |
+| `recover` | `--pane PANE_ID`. Reopen the same native thread in the worker pane when the verified backend or TUI exits and the receiver can recover. |
+
+The receiver verifies the exact Codex account before automated admission and shares a turn-admission lock with the TUI. Existing noninteractive Codex and Hermes ACP operations retain their original contracts.
+
 Protocol references: [Codex App Server](https://developers.openai.com/codex/app-server) and [Hermes ACP](https://hermes-agent.nousresearch.com/docs/user-guide/features/acp).

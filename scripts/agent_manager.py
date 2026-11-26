@@ -30,9 +30,10 @@ HERE = Path(__file__).resolve()
 
 
 class Error(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code, message, **details):
         super().__init__(message)
         self.code = code
+        self.details = details
 
 
 def home():
@@ -76,15 +77,16 @@ def pane_call(operation, instance, workspace, *args, data=None, timeout: float=4
         raise Error('pane_manager_unavailable', 'No verified pane-manager result; inspect state before retrying') from exc
     if proc.returncode or out.get('ok') is not True or not isinstance(out.get('result'), dict):
         failure = out.get('error') or {}
-        raise Error(str(failure.get('code', 'pane_manager_rejected')), str(failure.get('message', 'Pane call failed')))
+        details = {'pane_id': failure['pane_id']} if isinstance(failure.get('pane_id'), str) else {}
+        raise Error(str(failure.get('code', 'pane_manager_rejected')), str(failure.get('message', 'Pane call failed')), **details)
     return out['result']
 
 
-def guard(instance, workspace, pane, timeout: float=40):
+def guard(instance, workspace, pane, timeout: float=40, *, allow_locked=False):
     result = pane_call('lock-status', instance, workspace, '--pane', pane, timeout=timeout)
     if result.get('pane_id') != pane or type(result.get('user_locked')) is not bool:
         raise Error('lock_unknown', 'Cannot verify the exact pane and its lock')
-    if result['user_locked']:
+    if result['user_locked'] and not allow_locked:
         raise Error('user_locked', 'The pane is under user control')
 
 
@@ -492,11 +494,14 @@ class Codex(ChildRpc):
     label = 'Codex'
     kind = 'codex'
 
-    def __init__(self, cwd, check=None):
+    def __init__(self, cwd, check=None, *, launch_profile=None):
         binary = agent_binary('codex')
         if not binary:
             raise Error('codex_missing', 'Install and authenticate Codex before using this skill')
-        super().__init__(cwd, [binary, '-c', 'features.fast_mode=false', 'app-server', '--listen', 'stdio://'])
+        args = [binary, '-c', 'features.fast_mode=false']
+        if launch_profile:
+            args.extend(['--profile', launch_profile])
+        super().__init__(cwd, [*args, 'app-server', '--listen', 'stdio://'])
         try:
             self.rpc('initialize', {'clientInfo':{'name':'hermes_herdr_agent_manager','title':'Hermes Herdr Agent Manager','version':'0.1.0'}},check)
             self.write({'method':'initialized'},check)
@@ -1014,8 +1019,22 @@ class HermesReceiver(Receiver):
         self.model = model
 
 
-def serve(token, cwd, scope, agent='codex'):
-    receiver = HermesReceiver(cwd) if agent == 'hermes' else Receiver(cwd)
+@lru_cache(maxsize=1)
+def interactive_module():
+    try:
+        spec = importlib.util.spec_from_file_location('agent_manager_interactive', HERE.with_name('interactive_codex.py'))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except (ImportError, OSError) as exc:
+        raise Error('interactive_unavailable', 'Interactive Codex requires Python websockets 15') from exc
+    return module
+
+
+def serve(token, cwd, scope, agent='codex', *, model=None, worker=None, launch_profile=None):
+    if worker is not None:
+        receiver = interactive_module().build(sys.modules[__name__])(cwd, model, launch_profile, worker)
+    else:
+        receiver = HermesReceiver(cwd) if agent == 'hermes' else Receiver(cwd)
     slots = threading.BoundedSemaphore(8)
     def handle(conn):
         with conn:
@@ -1035,7 +1054,9 @@ def serve(token, cwd, scope, agent='codex'):
                     if remaining <= 0:
                         raise Error('deadline_elapsed', 'Receiver request expired')
                     pane = packet.get('pane')
-                    if not isinstance(pane, str) or bound(scope, pane, timeout=min(remaining,40)) != token:
+                    read_only = packet['op'] in ('status', 'result') or (worker is not None and packet['op'] == 'wait')
+                    if not isinstance(pane, str) or bound(scope, pane, timeout=min(remaining,40),
+                                                         allow_locked=read_only) != token:
                         raise Error('bad_binding', 'This receiver is not bound to the requested pane')
                     if time.monotonic() >= until:
                         raise Error('deadline_elapsed', 'Receiver request expired during verification')
@@ -1044,6 +1065,8 @@ def serve(token, cwd, scope, agent='codex'):
                     check()
                 if packet.get('op') in ('wait','steer','steer-bound','steer-admitted','steer-bound-admitted') and (type(packet.get('seconds')) is not int or not 1 <= packet['seconds'] <= 600):
                     raise Error('invalid_wait', 'Wait must be 1 through 600 seconds')
+                if worker is None and packet.get('op') in ('status', 'result'):
+                    raise Error('unsupported_operation', 'Exact managed-worker inspection requires an interactive receiver')
                 result = {'ok':True,'result':receiver.dispatch(packet,check)}
             except Error as e:
                 result = {'ok':False,'error':{'code':e.code,'message':str(e)}}
@@ -1056,6 +1079,12 @@ def serve(token, cwd, scope, agent='codex'):
             finally:
                 slots.release()
     with listen_channel(token) as accept:
+        if worker is not None:
+            pane = os.environ.get('HERDR_PANE_ID')
+            if not pane:
+                raise Error('bad_binding', 'Interactive workers must start inside a Herdr pane')
+            guard(*scope, pane, allow_locked=True)
+            save_binding(scope, pane, token, agent)
         print('Hermes Herdr Agent Manager ready', flush=True)
         while True:
             conn = accept()
@@ -1091,35 +1120,11 @@ def receiver_result(result):
     raise Error('outcome_unknown','Malformed receiver receipt; inspect state before retrying')
 
 
-def provision(scope: tuple[str, str], cwd, group, suffix, agent='codex'):
-    token = uuid.uuid4().hex + uuid.uuid4().hex
-    cwd = cwd_path(cwd)
-    cwd_state = state_dir()
-    launch = [sys.executable,'-I','-B',str(HERE),'_serve',token,cwd,*scope,str(home())]
-    if agent != 'codex':
-        launch.append(agent)
-    result = pane_call('create',*scope,'--cwd',cwd,'--group',group,'--suffix',suffix,'--argv-stdin',
-                       data=json.dumps(launch))
-    pane = result.get('pane_id')
-    if not isinstance(pane,str) or not pane:
-        raise Error('outcome_unknown','Pane manager did not identify the provisioned pane')
-    until = time.monotonic() + 10
-    while True:
-        try:
-            hello = request(token,'hello')
-            expected = {'receiver':True,'cwd':cwd}
-            if agent != 'codex':
-                expected['agent'] = agent
-            if hello != expected:
-                raise Error('bad_binding','Receiver identity did not match')
-            break
-        except Error as exc:
-            if exc.code != 'receiver_unavailable' or time.monotonic() >= until:
-                raise Error('partial_provision', f'Pane {pane} exists; receiver was not verified. Do not create a duplicate blindly') from exc
-            time.sleep(.1)
+def save_binding(scope, pane, token, agent):
     record = {'token':token,'scope':[*scope,pane],'agent':agent}
-    target = cwd_state / (binding_key(*scope,pane) + '.json')
-    pending = cwd_state / (token + '.tmp')
+    directory = state_dir()
+    target = directory / (binding_key(*scope,pane) + '.json')
+    pending = directory / (token + '.tmp')
     created = False
     try:
         if os.name == 'nt':
@@ -1131,15 +1136,73 @@ def provision(scope: tuple[str, str], cwd, group, suffix, agent='codex'):
             json.dump(record,stream)
         os.replace(pending,target)
     except OSError as exc:
-        raise Error('partial_provision', f'Pane {pane} exists; binding was not saved. Do not create a duplicate blindly') from exc
+        raise Error('partial_provision', f'Pane {pane} exists but its binding was not saved', pane_id=pane) from exc
     finally:
         if created:
             with suppress(OSError):
                 pending.unlink(missing_ok=True)
+
+
+def provision(scope: tuple[str, str], cwd, group, suffix, agent='codex', *,
+              status=None, model=None, worker=None, launch_profile=None):
+    token = uuid.uuid4().hex + uuid.uuid4().hex
+    cwd = cwd_path(cwd)
+    state_dir()
+    launch = [sys.executable,'-I','-B',str(HERE),'_serve',token,cwd,*scope,str(home())]
+    if worker is not None:
+        module = interactive_module()
+        module.preflight(sys.modules[__name__], cwd, model, launch_profile)
+        import websockets
+        package_root = str(Path(websockets.__file__).resolve().parents[1])
+        launch = [sys.executable, '-I', '-B', '-c',
+                  f'import runpy,sys;sys.path.append({package_root!r});'
+                  f'runpy.run_path({str(HERE)!r},run_name="__main__")',
+                  '_serve', token, cwd, *scope, str(home()), 'codex',
+                  '--worker', worker, '--model', model]
+        if launch_profile:
+            launch.extend(['--launch-profile', launch_profile])
+    elif agent != 'codex':
+        launch.append(agent)
+    label_args = ['--status', status] if status else ['--suffix', suffix]
+    result = pane_call('create',*scope,'--cwd',cwd,'--group',group,*label_args,'--argv-stdin',
+                       data=json.dumps(launch))
+    pane = result.get('pane_id')
+    if not isinstance(pane,str) or not pane:
+        raise Error('outcome_unknown','Pane manager did not identify the provisioned pane')
+    until = time.monotonic() + 10
+    while True:
+        try:
+            hello = request(token,'hello')
+            expected = {'receiver':True,'cwd':cwd}
+            if worker is not None:
+                expected.update(worker=worker, interactive=True)
+            elif agent != 'codex':
+                expected['agent'] = agent
+            if hello != expected:
+                raise Error('bad_binding','Receiver identity did not match')
+            break
+        except Error as exc:
+            if exc.code != 'receiver_unavailable' or time.monotonic() >= until:
+                raise Error('partial_provision', f'Pane {pane} exists but its receiver was not verified', pane_id=pane) from exc
+            time.sleep(.1)
+    if worker is not None:
+        until = time.monotonic() + 20
+        while time.monotonic() < until:
+            try:
+                if bound(scope, pane, allow_locked=True) != token:
+                    raise Error('bad_binding', 'The interactive receiver did not bind the created pane')
+                snapshot = request(token, 'status', pane=pane)
+                if snapshot.get('thread_id') and snapshot.get('state') == 'idle':
+                    return dict(snapshot, pane_id=pane, status='ready')
+            except Error:
+                pass
+            time.sleep(.2)
+        raise Error('partial_provision', 'Pane exists but its Codex TUI attachment was not verified', pane_id=pane)
+    save_binding(scope, pane, token, agent)
     return {'pane_id':pane,'cwd':cwd,'agent':agent,'status':'ready'}
 
 
-def verified_binding(scope: tuple[str, str], pane, timeout: float=40, *, agent=None):
+def verified_binding(scope: tuple[str, str], pane, timeout: float=40, *, agent=None, allow_locked=False):
     target = binding_file(*scope,pane)
     try:
         if os.name == 'nt':
@@ -1162,19 +1225,27 @@ def verified_binding(scope: tuple[str, str], pane, timeout: float=40, *, agent=N
         raise Error('bad_binding','Cannot verify this pane agent')
     if agent is not None and owner != agent:
         raise Error('agent_mismatch', f'This pane was not provisioned for {agent}')
-    guard(*scope,pane,timeout=timeout)
+    guard(*scope,pane,timeout=timeout,allow_locked=allow_locked)
     return value['token'], owner
 
 
-def bound(scope: tuple[str, str], pane, timeout: float=40, *, agent=None):
-    return verified_binding(scope,pane,timeout,agent=agent)[0]
+def bound(scope: tuple[str, str], pane, timeout: float=40, *, agent=None, allow_locked=False):
+    return verified_binding(scope,pane,timeout,agent=agent,allow_locked=allow_locked)[0]
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='op',required=True)
-    for op in ('provision','run','steer','change-model','get-remaining-tokens','check-quota','wait','recover'):
+    for op in ('provision','run','steer','change-model','get-remaining-tokens','check-quota','wait','recover',
+               'status','result','preflight','account-quota'):
         p = commands.add_parser(op,allow_abbrev=False)
+        if op in ('preflight','account-quota'):
+            p.add_argument('--launch-profile')
+            if op == 'preflight':
+                p.add_argument('--cwd', required=True)
+                p.add_argument('--model', required=True)
+                p.add_argument('--agent', required=True, choices=AGENTS)
+            continue
         p.add_argument('--instance',required=True)
         p.add_argument('--workspace',required=True)
         if op != 'provision':
@@ -1188,7 +1259,10 @@ def main():
         if op == 'provision':
             p.add_argument('--group',default='agents')
             p.add_argument('--suffix')
-        if op in ('run','change-model'):
+            p.add_argument('--status')
+            p.add_argument('--worker', help='Provision a managed interactive Codex worker')
+            p.add_argument('--launch-profile')
+        if op in ('run','change-model','provision'):
             p.add_argument('--model',required=op == 'change-model',help='Required for Codex run; Hermes can use the profile model')
         if op == 'run':
             p.add_argument('--network',action='store_true',help='Only for explicitly authorized Codex sandbox networking')
@@ -1197,6 +1271,7 @@ def main():
             prompt = p.add_mutually_exclusive_group(required=True)
             prompt.add_argument('--prompt')
             prompt.add_argument('--prompt-stdin',action='store_true')
+            prompt.add_argument('--request-stdin', action='store_true', help='Read JSON prompt and run parameters')
         if op in ('steer','wait'):
             p.add_argument('--seconds',type=int,choices=range(1,601),metavar='1-600',default=120)
         if op in ('steer','wait'):
@@ -1204,6 +1279,9 @@ def main():
         if op=='steer':
             p.add_argument('--thread-id',help='Require this native thread for an idle follow-up')
             p.add_argument('--after-turn-id',help='Also require this last turn; use with --thread-id')
+            p.add_argument('--return-admission', action='store_true')
+        if op == 'result':
+            p.add_argument('--turn-id', required=True)
     internal=commands.add_parser('_serve',allow_abbrev=False)
     internal.add_argument('token')
     internal.add_argument('cwd')
@@ -1211,6 +1289,9 @@ def main():
     internal.add_argument('workspace')
     internal.add_argument('profile_home')
     internal.add_argument('agent',nargs='?',default='codex',choices=AGENTS)
+    internal.add_argument('--worker')
+    internal.add_argument('--model')
+    internal.add_argument('--launch-profile')
     a=parser.parse_args()
     if a.op == 'run' and a.agent == 'codex' and a.model is None:
         parser.error('run --agent codex requires --model')
@@ -1226,20 +1307,45 @@ def main():
         if a.op == '_serve':
             os.environ['HERMES_HOME'] = a.profile_home
             pane_script()
-            serve(a.token,cwd_path(a.cwd),(a.instance,a.workspace),a.agent)
+            serve(a.token,cwd_path(a.cwd),(a.instance,a.workspace),a.agent, model=a.model,
+                  worker=a.worker, launch_profile=a.launch_profile)
             return 0
-        pane_script()
-        scope=(a.instance,a.workspace)
-        if a.op == 'provision':
+        scope=(getattr(a, 'instance', None),getattr(a, 'workspace', None))
+        if a.op == 'preflight':
+            if a.agent != 'codex':
+                raise Error('interactive_unavailable', 'This backend has no managed interactive receiver')
+            result=interactive_module().preflight(sys.modules[__name__],a.cwd,a.model,a.launch_profile)
+        elif a.op == 'account-quota':
+            module=interactive_module()
+            module.validate_profile(sys.modules[__name__],a.launch_profile)
+            probe=Codex(str(Path.home()), launch_profile=a.launch_profile)
+            try:
+                result=module.read_quota(sys.modules[__name__], probe)
+            finally:
+                probe.stop_unassigned()
+        elif a.op == 'provision':
             suffix = a.suffix if a.suffix is not None else {'codex':'Codex','hermes':'Hermes'}[a.agent]
-            result=provision(scope,a.cwd,a.group,suffix,a.agent)
+            if a.worker and (a.agent != 'codex' or not a.model):
+                raise Error('invalid_argument', 'A managed interactive worker requires Codex and a model')
+            if not a.worker and (a.launch_profile or a.model):
+                raise Error('invalid_argument', 'Use --worker with a launch profile or model')
+            result=provision(scope,a.cwd,a.group,suffix,a.agent,status=a.status,model=a.model,
+                             worker=a.worker,launch_profile=a.launch_profile)
         else:
-            token, owner=verified_binding(scope,a.pane,agent=getattr(a,'agent',None))
+            token, owner=verified_binding(scope,a.pane,agent=getattr(a,'agent',None),
+                                          allow_locked=a.op in ('status','result'))
             fields={'pane':a.pane}
             if a.op in ('run','get-remaining-tokens'):
                 fields['agent']=a.agent
             if a.op in ('run','steer'):
-                fields['prompt']=sys.stdin.buffer.read(MAX_PROMPT+1).decode() if a.prompt_stdin else a.prompt
+                if a.request_stdin:
+                    body = read_frame(sys.stdin.buffer)
+                    if not isinstance(body.get('parameters',{}),dict):
+                        raise Error('invalid_parameters','Run parameters must be an object')
+                    fields.update(prompt=body.get('prompt'),parameters=body.get('parameters',{}),
+                                  account=body.get('account'))
+                else:
+                    fields['prompt']=sys.stdin.buffer.read(MAX_PROMPT+1).decode() if a.prompt_stdin else a.prompt
                 text_input(fields['prompt'])
                 if owner=='codex':
                     fields['override_quota']=a.override_quota
@@ -1253,10 +1359,11 @@ def main():
                 fields.update(cwd=cwd_path(a.cwd),network=a.network)
             if a.op in ('steer','wait'):
                 fields['seconds']=a.seconds
-            if a.op == 'wait':
+            if a.op in ('wait','result'):
                 fields['turn_id']=a.turn_id
             if a.op == 'steer':
                 fields['expected_turn']=a.turn_id
+                fields['return_admission']=a.return_admission
             op='quota' if a.op=='get-remaining-tokens' else a.op
             if a.op=='steer' and a.thread_id is not None:
                 fields.update(expected_thread=a.thread_id,after_turn=a.after_turn_id)
@@ -1267,7 +1374,7 @@ def main():
         print(json.dumps(dict(ok=True,result=result)))
         return 0
     except (Error, OSError, ValueError) as e:
-        failure = dict(code=e.code,message=str(e)) if isinstance(e,Error) else dict(code='local_error',message='Local file, state, or input failed verification')
+        failure = dict(code=e.code,message=str(e),**e.details) if isinstance(e,Error) else dict(code='local_error',message='Local file, state, or input failed verification')
         print(json.dumps(dict(ok=False,error=failure)))
         return 1
 
